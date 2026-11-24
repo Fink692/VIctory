@@ -28,11 +28,13 @@ $environment = @{
     VICTORY_WARP = '1'
     VICTORY_D3D12_WARP = '1'
     VICTORY_ATOMIC_TRACE = '1'
+    VICTORY_LDS_TRACE = '1'
     CARGO_TARGET_DIR = (Join-Path $script:VictoryRepoRoot 'target')
     CARGO_TERM_COLOR = 'never'
 }
 if ($env:VICTORY_DXIL) { $environment.VICTORY_DXIL = $env:VICTORY_DXIL }
 $runs = [Collections.Generic.List[object]]::new()
+$failures = [Collections.Generic.List[string]]::new()
 $summary = [ordered]@{
     schema_version = 1
     started_at_utc = [DateTime]::UtcNow.ToString('o')
@@ -76,23 +78,59 @@ try {
     # is a failure even when CDB itself subsequently exits successfully.
     # A live exception already selects its faulting context; .ecxr is for dumps.
     @'
-sxd -c2 ".echo VICTORY_NATIVE_UNHANDLED; .lastevent; .exr -1; r; kn 64; ~* kn 32; lm; q" av
+sxd -c2 ".echo VICTORY_NATIVE_UNHANDLED; .lastevent; .exr -1; r; kn 64; ~* kn 32; lm; lmvm d3d10warp; lmvm D3D12Core; q" av
 .echo VICTORY_NATIVE_DEBUGGER_READY
 g
 '@ | Set-Content -LiteralPath $commands -Encoding ascii
     $symbols = (Split-Path $executable -Parent) + ';srv*' + (Join-Path $report 'symbols') + '*https://msdl.microsoft.com/download/symbols'
-    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
-        $prefix = Join-Path $report "attempt-$attempt"
+    function Invoke-NativeShaderRun {
+        param(
+            [Parameter(Mandatory)][string]$Label,
+            [string[]]$TestArguments = @(),
+            [uint32]$ExpectedTests = 0,
+            [switch]$RequireLdsCoverage
+        )
+        $prefix = Join-Path $report $Label
         $nativeLog = $prefix + '.native.log'
-        $arguments = @('-G', '-lines', '-y', $symbols, '-logo', $nativeLog, '-cf', $commands, $executable, '--nocapture', "--test-threads=$TestThreads")
-        $result = Invoke-VictoryProcess -Executable $CdbPath -Arguments $arguments -WorkingDirectory $script:VictoryRepoRoot -LogPrefix $prefix -Environment $environment -TimeoutSeconds 300
-        $run = [ordered]@{ attempt = $attempt; process = $result; native_log = $nativeLog }
+        $arguments = @('-G', '-lines', '-y', $symbols, '-logo', $nativeLog, '-cf', $commands, $executable) + $TestArguments + @('--nocapture', "--test-threads=$TestThreads")
+        $runEnvironment = $environment.Clone()
+        $runEnvironment.VICTORY_CACHE_DIR = Join-Path $report "$Label-cache"
+        $runEnvironment.VICTORY_DATA_DIR = Join-Path $report "$Label-data"
+        $run = [ordered]@{ label = $Label; status = 'running'; native_log = $nativeLog }
         $runs.Add($run)
-        Assert-VictoryProcessSucceeded $result "native-shader-attempt-$attempt"
-        $output = (Get-Content -LiteralPath $result.stdout_log -Raw) + (Get-Content -LiteralPath $result.stderr_log -Raw)
-        if (Test-Path -LiteralPath $nativeLog) { $output += Get-Content -LiteralPath $nativeLog -Raw }
-        $run['coverage'] = Get-VictoryNativeShaderCoverage $output
-        Write-Host "Native shader attempt $attempt completed: $($run.coverage.passed) tests reported passed."
+        try {
+            $result = Invoke-VictoryProcess -Executable $CdbPath -Arguments $arguments -WorkingDirectory $script:VictoryRepoRoot -LogPrefix $prefix -Environment $runEnvironment -TimeoutSeconds 300
+            $run['process'] = $result
+            Assert-VictoryProcessSucceeded $result "native-shader-$Label"
+            $output = (Get-Content -LiteralPath $result.stdout_log -Raw) + (Get-Content -LiteralPath $result.stderr_log -Raw)
+            if (Test-Path -LiteralPath $nativeLog) { $output += Get-Content -LiteralPath $nativeLog -Raw }
+            $run['coverage'] = Get-VictoryNativeShaderCoverage $output
+            if ($ExpectedTests -and ($run.coverage.passed -ne $ExpectedTests -or $run.coverage.ignored -ne 0)) {
+                throw "$Label must complete exactly $ExpectedTests tests with none ignored."
+            }
+            if ($RequireLdsCoverage) {
+                $markers = @([regex]::Matches($output, '(?m)^VICTORY_LDS_RESULT=[^\r\n]*') | ForEach-Object { $_.Value } | Select-Object -Unique)
+                $run['semantic_coverage'] = Get-VictoryLdsCoverage ($markers -join "`n")
+            }
+            $run.status = 'passed'
+            Write-Host "Native shader $Label completed: $($run.coverage.passed) tests reported passed."
+        } catch {
+            $run.status = 'failed'
+            $run['error'] = $_.Exception.Message
+            $failures.Add($Label)
+            Write-Host "Native shader $Label failed: $($run.error)"
+        }
+    }
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        Invoke-NativeShaderRun -Label "attempt-$attempt"
+    }
+    if ($failures.Count) {
+        # Independent child processes distinguish the newly added LDS shader
+        # from the older concurrent VALU cases. Their results cannot erase a
+        # failed full-suite run, and neither control serializes the suite.
+        Invoke-NativeShaderRun -Label 'isolated-lds' -TestArguments @('emit::lds_tests::lds_subword_results_preserve_adjacent_bytes', '--exact') -ExpectedTests 1 -RequireLdsCoverage
+        Invoke-NativeShaderRun -Label 'isolated-valu' -TestArguments @('emit::valu_tests::') -ExpectedTests 7
+        throw "Native shader runs failed: $($failures -join ', '). See each run's logs."
     }
     $summary.status = 'passed'
 } catch {

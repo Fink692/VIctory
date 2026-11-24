@@ -315,6 +315,16 @@ fn lds_subword_programs_translate_and_validate() {
 }
 
 #[cfg(windows)]
+fn trace(args: std::fmt::Arguments<'_>) {
+    if std::env::var("VICTORY_LDS_TRACE").is_ok_and(|v| v == "1") {
+        use std::io::Write;
+        let mut stderr = std::io::stderr().lock();
+        writeln!(stderr, "VICTORY_LDS_TRACE {args}").unwrap();
+        stderr.flush().unwrap();
+    }
+}
+
+#[cfg(windows)]
 fn expected(read: Read, high: bool, offset: u16, layout: Layout, inputs: [u32; 4]) -> Vec<u32> {
     let mut memory = vec![0u8; LDS_BYTES];
     for word in memory.as_chunks_mut::<4>().0 {
@@ -393,6 +403,7 @@ fn lds_subword_results_preserve_adjacent_bytes() {
     let mut ran = 0;
     let mut count = 0;
     for &(label, warp) in adapters {
+        trace(format_args!("phase=device_begin adapter={label:?}"));
         let host = match Host::new(warp) {
             Ok(host) => host,
             Err(e) if required => panic!("required WARP device unavailable: {e}"),
@@ -401,6 +412,7 @@ fn lds_subword_results_preserve_adjacent_bytes() {
                 continue;
             }
         };
+        trace(format_args!("phase=device_end adapter={label:?}"));
         ran += 1;
         for &read in READS {
             for high in [false, true] {
@@ -416,7 +428,15 @@ fn lds_subword_results_preserve_adjacent_bytes() {
                     ]);
                 for (offset, layout) in variants {
                     let shader = build(read, high, offset, layout, false);
+                    trace(format_args!(
+                        "phase=pipeline_begin adapter={label:?} first_case={} read={read:?} high={high} offset={offset} layout={layout:?}",
+                        count + 1
+                    ));
                     let (root, pipeline) = host.compute_pipeline(&shader).unwrap();
+                    trace(format_args!(
+                        "phase=pipeline_end adapter={label:?} first_case={} read={read:?} high={high} offset={offset} layout={layout:?}",
+                        count + 1
+                    ));
                     for inputs in [
                         [0xa55a_c33c, 0x807f_80ff, 0x694b_1de7, 0],
                         [0x0000_0000, 0xffff_8000, 0xdead_beef, 0],
@@ -431,6 +451,10 @@ fn lds_subword_results_preserve_adjacent_bytes() {
                                 other => panic!("unexpected user data {other:?}"),
                             };
                         }
+                        trace(format_args!(
+                            "phase=dispatch_begin adapter={label:?} case={} read={read:?} high={high} offset={offset} layout={layout:?} inputs={inputs:x?}",
+                            count + 1
+                        ));
                         let actual = host
                             .dispatch(
                                 &root,
@@ -448,6 +472,10 @@ fn lds_subword_results_preserve_adjacent_bytes() {
                             expected(read, high, offset, layout, inputs),
                             "{label}: {read:?}, high={high}, offset={offset}, layout={layout:?}, inputs={inputs:x?}"
                         );
+                        trace(format_args!(
+                            "phase=dispatch_end adapter={label:?} case={}",
+                            count + 1
+                        ));
                         count += 1;
                     }
                 }

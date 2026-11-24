@@ -49,26 +49,35 @@ function Invoke-Check {
     $checkEnvironment = $environment.Clone()
     foreach ($key in $EnvironmentOverrides.Keys) { $checkEnvironment[$key] = $EnvironmentOverrides[$key] }
     $result = Invoke-VictoryProcess -Executable $Executable -Arguments $Arguments -WorkingDirectory $script:VictoryRepoRoot -LogPrefix (Join-Path $report $Name) -Environment $checkEnvironment -TimeoutSeconds 1200
-    $check = [ordered]@{ name = $Name; process = $result }
+    $check = [ordered]@{ name = $Name; process = $result; status = 'running' }
     if ($EnvironmentOverrides.Count -gt 0) { $check['environment_overrides'] = $EnvironmentOverrides }
     $checks.Add($check)
-    Assert-VictoryProcessSucceeded $result $Name
-    if ($MustRunOneTest -or $MustValidateAtomicMatrix -or $OptionalAtomicSemantics -or $MustValidateLdsMatrix -or $MustExecuteLds -or $OptionalDepthBounds) {
-        $output = (Get-Content -LiteralPath $result.stdout_log -Raw) + (Get-Content -LiteralPath $result.stderr_log -Raw)
-        if ($output -notmatch 'test result: ok\. 1 passed;' -or ($MustRunOneTest -and $output -match '; skipped')) {
-            throw "$Name did not run its required test successfully. See $($result.stdout_log)."
+    try {
+        Assert-VictoryProcessSucceeded $result $Name
+        if ($MustRunOneTest -or $MustValidateAtomicMatrix -or $OptionalAtomicSemantics -or $MustValidateLdsMatrix -or $MustExecuteLds -or $OptionalDepthBounds) {
+            $output = (Get-Content -LiteralPath $result.stdout_log -Raw) + (Get-Content -LiteralPath $result.stderr_log -Raw)
+            if ($output -notmatch 'test result: ok\. 1 passed;' -or ($MustRunOneTest -and $output -match '; skipped')) {
+                throw "$Name did not run its required test successfully. See $($result.stdout_log)."
+            }
+            if ($MustValidateAtomicMatrix) { $check['coverage'] = Get-VictoryAtomicValidationCoverage $output }
+            if ($MustValidateLdsMatrix) { $check['coverage'] = Get-VictoryLdsValidationCoverage $output }
+            if ($MustExecuteLds) { $check['coverage'] = Get-VictoryLdsCoverage $output }
+            if ($OptionalDepthBounds) {
+                $check['coverage'] = Get-VictoryDepthBoundsCoverage $output
+                Write-Host "$Name coverage: $($check.coverage.status); cases=$($check.coverage.cases)."
+            }
+            if ($OptionalAtomicSemantics) {
+                $check['coverage'] = Get-VictoryAtomic64Coverage $output
+                Write-Host "$Name coverage: $($check.coverage.status); adapters=$($check.coverage.adapters); cases=$($check.coverage.cases)."
+            }
         }
-        if ($MustValidateAtomicMatrix) { $check['coverage'] = Get-VictoryAtomicValidationCoverage $output }
-        if ($MustValidateLdsMatrix) { $check['coverage'] = Get-VictoryLdsValidationCoverage $output }
-        if ($MustExecuteLds) { $check['coverage'] = Get-VictoryLdsCoverage $output }
-        if ($OptionalDepthBounds) {
-            $check['coverage'] = Get-VictoryDepthBoundsCoverage $output
-            Write-Host "$Name coverage: $($check.coverage.status); cases=$($check.coverage.cases)."
-        }
-        if ($OptionalAtomicSemantics) {
-            $check['coverage'] = Get-VictoryAtomic64Coverage $output
-            Write-Host "$Name coverage: $($check.coverage.status); adapters=$($check.coverage.adapters); cases=$($check.coverage.cases)."
-        }
+        $check.status = 'passed'
+    } catch {
+        # Independent checks still provide useful evidence after a native
+        # crash. Preserve every failure and reject the overall gate below.
+        $check.status = 'failed'
+        $check['error'] = $_.Exception.Message
+        Write-Warning "$Name failed: $($check.error)"
     }
 }
 
@@ -116,6 +125,9 @@ try {
     Invoke-Check 'release-build' 'cargo' @('build', '--locked', '--release', '-p', 'victory')
     Invoke-Check 'diagnostics-build' 'cargo' @('build', '--locked', '--profile', 'diag', '-p', 'victory', '--features', 'diagnostics')
     Invoke-Check 'asset-policy' 'cargo' @('run', '--locked', '--quiet', '-p', 'xtask', '--', 'policy')
+    $failed = @($checks | Where-Object { $_.status -eq 'failed' } | ForEach-Object { $_.name })
+    $summary['failed_checks'] = $failed
+    if ($failed.Count -gt 0) { throw "Validation failed: $($failed -join ', '). See each check's report for details." }
     $summary.status = 'passed'
 } catch {
     $summary.status = 'failed'
