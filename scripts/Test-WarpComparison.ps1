@@ -161,7 +161,9 @@ g
                         VICTORY_DEPTH_BOUNDS_TRACE = '1'
                         CARGO_TERM_COLOR = 'never'
                     }
-                    $environment.VICTORY_D3D12_DEBUG = if ($kind -eq 'gpu') { '1' } else { '0' }
+                    # Invoke-VictoryProcess removes inherited VICTORY_ values;
+                    # the shader controls intentionally leave this absent.
+                    if ($kind -eq 'gpu') { $environment.VICTORY_D3D12_DEBUG = '1' }
                     if ($env:VICTORY_DXIL) { $environment.VICTORY_DXIL = $env:VICTORY_DXIL }
                     $result = Invoke-VictoryProcess -Executable $CdbPath -Arguments $arguments -WorkingDirectory $RepositoryRoot -LogPrefix $prefix -Environment $environment -TimeoutSeconds 300
                     $run['process'] = $result
