@@ -18,9 +18,8 @@
 //! indexed heaps keep what their first use copied, and arbitrary heap
 //! indices do not declare their state needs. Distinct overlapping shadow
 //! allocations are not coherent aliases. CPU snapshot paths (unaligned
-//! CBVs, expanded geometry, buffer-to-texture uploads) still cannot read
-//! same-submission GPU outputs; GPU buffer copies and known direct shader
-//! bindings can.
+//! CBVs and expanded geometry) still cannot read same-submission GPU
+//! outputs; GPU buffer/texture copies and known direct shader bindings can.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, Ordering};

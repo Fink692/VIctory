@@ -2070,6 +2070,21 @@ impl<'a> Lower<'a> {
             return Err("LDS the program does not allocate");
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
+        let subword = match name {
+            "ds_read_i8" | "ds_read_i8_d16" | "ds_read_i8_d16_hi" => Some((8, true)),
+            "ds_read_u8" | "ds_read_u8_d16" | "ds_read_u8_d16_hi" | "ds_write_b8"
+            | "ds_write_b8_d16_hi" => Some((8, false)),
+            "ds_read_i16" => Some((16, true)),
+            "ds_read_u16"
+            | "ds_read_u16_d16"
+            | "ds_read_u16_d16_hi"
+            | "ds_write_b16"
+            | "ds_write_b16_d16_hi" => Some((16, false)),
+            _ => None,
+        };
+        if let Some((bits, signed)) = subword {
+            return self.lds_subword(inst, a, offset, bits, signed, guard);
+        }
         // shortcut: LDS addresses are taken as dword-aligned and in bounds
         // (out-of-bounds console accesses read 0 and drop writes).
         let dword = |l: &mut Self, bytes: u32| -> V {
@@ -2183,6 +2198,128 @@ impl<'a> Lower<'a> {
         let r = self.end_guarded(at, &[(r, outside)])[0];
         if let Some(reg) = dst_reg {
             self.write(inst, Reg::V(reg), r, None);
+        }
+        Ok(())
+    }
+
+    /// Byte and native-aligned halfword LDS accesses. Like the wider LDS
+    /// path, this uses native alignment; mode-controlled unaligned accesses
+    /// are not modeled. RDNA2 ISA 10.4.3 and 12.13 define sign extension,
+    /// masked d16 destinations and the high-half store source.
+    fn lds_subword(
+        &mut self,
+        inst: &Inst,
+        address: V,
+        offset: u32,
+        bits: u32,
+        signed: bool,
+        guard: Option<V>,
+    ) -> Result<(), Why> {
+        let Fields::Ds { dst, data, .. } = &inst.fields else {
+            unreachable!()
+        };
+        let name = inst.name();
+        let c = self.cur;
+        let offset = self.s.m.i32(offset);
+        let raw = self.s.m.bin(c, Bin::Add, address, offset);
+        // Do not let a wrapped offset turn an out-of-range address into an
+        // access to the start of LDS. Form pointers only in the valid branch.
+        let nowrap = self.s.m.cmp(c, pred::IUGE, raw, address);
+        let align = self.s.m.i32(!(bits / 8 - 1));
+        let byte = self.s.m.bin(c, Bin::And, raw, align);
+        let last = self.s.m.i32(self.s.lds_dwords * 4 - bits / 8);
+        let inside = self.s.m.cmp(c, pred::IULE, byte, last);
+        let valid = self.s.m.bin(c, Bin::And, nowrap, inside);
+        let enabled = match guard {
+            Some(g) => self.s.m.bin(c, Bin::And, valid, g),
+            None => valid,
+        };
+        let (three, two) = (self.s.m.i32(3), self.s.m.i32(2));
+        let within = self.s.m.bin(c, Bin::And, byte, three);
+        let shift = self.s.m.bin(c, Bin::Shl, within, three);
+        let index = self.s.m.bin(c, Bin::LShr, byte, two);
+        let is_read = name.starts_with("ds_read_");
+        let mut source = if is_read {
+            None
+        } else {
+            Some(self.vgprs(inst, data.first().ok_or("an LDS write")?, 1)?[0])
+        };
+        if name.ends_with("_hi")
+            && let Some(value) = source
+        {
+            let sixteen = self.s.m.i32(16);
+            source = Some(self.s.m.bin(c, Bin::LShr, value, sixteen));
+        }
+        let at = self.begin_guarded(Some(enabled));
+        let lds = self.s.lds();
+        let ptr = self.s.m.element(self.cur, lds, index);
+        if is_read {
+            // A different lane may concurrently store another byte in this
+            // host dword. A widened non-atomic load would race with its CAS;
+            // an atomic no-op reads the field without changing its neighbors.
+            let zero = self.s.m.i32(0);
+            let loaded = self
+                .s
+                .m
+                .atomic(self.cur, super::bitcode::Rmw::Or, ptr, zero);
+            let shifted = self.s.m.bin(self.cur, Bin::LShr, loaded, shift);
+            let left = self.s.m.i32(32 - bits);
+            let value = self.s.m.bin(self.cur, Bin::Shl, shifted, left);
+            let value = self.s.m.bin(
+                self.cur,
+                if signed { Bin::AShr } else { Bin::LShr },
+                value,
+                left,
+            );
+            let zero = self.s.m.i32(0);
+            let mut value = self.end_guarded(at, &[(value, zero)])[0];
+            let Some(Operand::Vector { reg, .. }) = *dst else {
+                return Err("an LDS read result");
+            };
+            if name.contains("_d16") {
+                if name.ends_with("_hi") {
+                    let c = self.cur;
+                    let old = match inst.read(Reg::V(reg)).map(|v| self.i32_of(v)) {
+                        Some(Ok(v)) => v,
+                        _ => self.s.m.i32(0),
+                    };
+                    let (low, sixteen) = (self.s.m.i32(0xFFFF), self.s.m.i32(16));
+                    let old = self.s.m.bin(c, Bin::And, old, low);
+                    let value_hi = self.s.m.bin(c, Bin::Shl, value, sixteen);
+                    value = self.s.m.bin(c, Bin::Or, old, value_hi);
+                } else {
+                    value = self.low_half(inst, reg, value);
+                }
+            }
+            self.write(inst, Reg::V(reg), value, guard);
+        } else {
+            let c = self.cur;
+            let mask = self.s.m.i32((1 << bits) - 1);
+            let value = self.s.m.bin(c, Bin::And, source.unwrap(), mask);
+            let value = self.s.m.bin(c, Bin::Shl, value, shift);
+            let mask = self.s.m.bin(c, Bin::Shl, mask, shift);
+            let all = self.s.m.i32(u32::MAX);
+            let keep = self.s.m.bin(c, Bin::Xor, mask, all);
+            // Different console byte addresses may occupy one host i32.
+            // A plain load/modify/store loses neighboring writes. A CAS
+            // retry updates just this field and atomically reads its peers;
+            // a non-atomic seed load would itself race with those updates.
+            let (retry, done) = (self.s.m.new_block(), self.s.m.new_block());
+            self.s.m.terminate(c, Term::Br(retry));
+            let expected = self.s.m.phi(retry, self.s.t.i32);
+            let preserved = self.s.m.bin(retry, Bin::And, expected, keep);
+            let updated = self.s.m.bin(retry, Bin::Or, preserved, value);
+            let observed = self.s.m.cmpxchg(retry, ptr, expected, updated);
+            let success = self.s.m.cmp(retry, pred::EQ, observed, expected);
+            self.s
+                .m
+                .terminate(retry, Term::CondBr(success, done, retry));
+            let zero = self.s.m.i32(0);
+            self.s
+                .m
+                .set_phi(expected, vec![(zero, c), (observed, retry)]);
+            self.cur = done;
+            self.end_guarded(at, &[]);
         }
         Ok(())
     }

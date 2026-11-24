@@ -69,7 +69,55 @@ exit $ExitCode
     Assert-That ($coverage.status -eq 'validated' -and $coverage.containers -eq 88) 'The atomic matrix must report independent validation.'
     Assert-Rejected { Get-VictoryAtomicValidationCoverage 'test result: ok. 1 passed;' } 'Compiler success cannot substitute for independent validation.'
     Assert-Rejected { Get-VictoryAtomicValidationCoverage 'VICTORY_ATOMIC_VALIDATION_RESULT=validated containers=87' } 'An incomplete validation matrix must fail.'
-    Write-Host 'Diagnostics harness checks passed: external paths, argument quoting, environment isolation, dual-stream capture, nonzero exit, timeout, no overwrite and explicit semantic coverage.'
+    $coverage = Get-VictoryLdsValidationCoverage 'VICTORY_LDS_VALIDATION_RESULT=validated containers=168'
+    Assert-That ($coverage.status -eq 'validated' -and $coverage.containers -eq 168) 'The full LDS matrix needs independent validation.'
+    Assert-Rejected { Get-VictoryLdsValidationCoverage 'VICTORY_LDS_VALIDATION_RESULT=validated containers=167' } 'An incomplete LDS validation matrix must fail.'
+    Assert-Rejected { Get-VictoryLdsValidationCoverage 'test result: ok. 1 passed;' } 'LDS compiler success cannot substitute for independent validation.'
+    $coverage = Get-VictoryShaderHashCoverage 'VICTORY_SHADER_HASH_RESULT=matched programs=2'
+    Assert-That ($coverage.status -eq 'matched' -and $coverage.programs -eq 2) 'Shader hashes must match two independent compiler outputs.'
+    Assert-Rejected { Get-VictoryShaderHashCoverage 'VICTORY_SHADER_HASH_RESULT=matched programs=1' } 'An incomplete compiler comparison must fail.'
+    Assert-Rejected { Get-VictoryShaderHashCoverage 'test result: ok. 1 passed;' } 'Compiler comparison cannot pass silently without running.'
+    $coverage = Get-VictoryLdsCoverage 'VICTORY_LDS_RESULT=executed adapters=2 cases=992'
+    Assert-That ($coverage.adapters -eq 2 -and $coverage.cases -eq 992) 'All LDS cases must execute per adapter.'
+    Assert-Rejected { Get-VictoryLdsCoverage 'VICTORY_LDS_RESULT=executed adapters=0 cases=0' } 'LDS execution is required, not optional.'
+    Assert-Rejected { Get-VictoryLdsCoverage 'VICTORY_LDS_RESULT=executed adapters=1 cases=495' } 'Missing LDS execution cases must fail.'
+    Assert-Rejected { Get-VictoryLdsCoverage 'VICTORY_LDS_RESULT=unsupported adapters=0 cases=0' } 'Unsupported LDS execution cannot pass the gate.'
+    Assert-Rejected { Get-VictoryLdsCoverage "VICTORY_LDS_RESULT=executed adapters=1 cases=496`nVICTORY_LDS_RESULT=executed adapters=2 cases=992" } 'Ambiguous LDS execution markers must fail.'
+    $coverage = Get-VictoryDepthBoundsCoverage 'VICTORY_DEPTH_BOUNDS_RESULT=executed cases=14'
+    Assert-That ($coverage.status -eq 'executed' -and $coverage.cases -eq 14) 'Depth-bounds execution must include every case.'
+    $coverage = Get-VictoryDepthBoundsCoverage 'VICTORY_DEPTH_BOUNDS_RESULT=unsupported cases=0'
+    Assert-That ($coverage.status -eq 'unsupported' -and $coverage.cases -eq 0) 'Unavailable depth bounds must remain explicit.'
+    Assert-Rejected { Get-VictoryDepthBoundsCoverage 'VICTORY_DEPTH_BOUNDS_RESULT=executed cases=13' } 'Partial depth-bounds execution must fail.'
+    Assert-Rejected { Get-VictoryDepthBoundsCoverage 'VICTORY_DEPTH_BOUNDS_RESULT=unsupported cases=14' } 'Unsupported depth bounds cannot claim execution.'
+    Assert-Rejected { Get-VictoryDepthBoundsCoverage 'test result: ok. 1 passed;' } 'A passing test alone cannot establish depth-bounds coverage.'
+    $nativeOk = "VICTORY_NATIVE_DEBUGGER_READY`ntest result: ok. 79 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s`n"
+    $coverage = Get-VictoryNativeShaderCoverage ($nativeOk + $nativeOk)
+    Assert-That ($coverage.status -eq 'completed' -and $coverage.passed -eq 79 -and $coverage.ignored -eq 0) 'Native coverage must tolerate a duplicate console/debugger log.'
+    Assert-Rejected { Get-VictoryNativeShaderCoverage 'test result: ok. 79 passed; 0 failed; 0 ignored;' } 'A debugger run needs its setup marker.'
+    Assert-Rejected { Get-VictoryNativeShaderCoverage 'VICTORY_NATIVE_DEBUGGER_READY' } 'Debugger success without a completed test suite must fail.'
+    Assert-Rejected { Get-VictoryNativeShaderCoverage ($nativeOk + "VICTORY_NATIVE_UNHANDLED`n") } 'An unhandled native exception must fail even with a zero debugger exit and earlier passing summary.'
+    Assert-Rejected { Get-VictoryNativeShaderCoverage ($nativeOk + "test result: FAILED. 1 passed; 1 failed; 0 ignored;`n") } 'A failed Rust suite must fail the debugger gate.'
+    Assert-Rejected { Get-VictoryNativeShaderCoverage ($nativeOk + "test result: ok. 78 passed; 0 failed; 0 ignored;`n") } 'Conflicting native terminal results must fail.'
+    Assert-Rejected { Get-VictoryNativeShaderCoverage "VICTORY_NATIVE_DEBUGGER_READY`ntest result: ok. 0 passed; 0 failed; 0 ignored;`n" } 'A debugger run must discover actual tests.'
+    $warpPath = 'C:\victory runtime\d3d10warp.dll'
+    $warpVersion = '1.0.22.0'
+    $warpModule = "VICTORY_WARP_MODULE_BEGIN`r`n    Image path: $warpPath`r`n    File version: $warpVersion`r`nVICTORY_WARP_MODULE_END`r`n"
+    $evidence = Get-VictoryWarpModuleEvidence -Output ($warpModule + $warpModule) -ExpectedPath $warpPath.ToUpperInvariant() -ExpectedVersion $warpVersion
+    Assert-That ($evidence.path -ceq $warpPath -and $evidence.file_version -eq $warpVersion) 'Loaded WARP evidence must tolerate duplicate output and case-insensitive Windows paths.'
+    $evidence = Get-VictoryWarpModuleEvidence -Output ($warpModule + "VICTORY_NATIVE_UNHANDLED`n")
+    Assert-That ($evidence.path -ceq $warpPath -and $evidence.file_version -eq $warpVersion) 'A failed native process must retain its observed runtime identity independently of test success.'
+    Assert-Rejected { Get-VictoryWarpModuleEvidence -Output $nativeOk -ExpectedPath $warpPath -ExpectedVersion $warpVersion } 'Passing tests cannot substitute for loaded WARP module evidence.'
+    Assert-Rejected { Get-VictoryWarpModuleEvidence -Output '' -ExpectedPath $warpPath -ExpectedVersion $warpVersion } 'Missing runtime output must not establish a WARP identity.'
+    Assert-Rejected { Get-VictoryWarpModuleEvidence -Output $warpModule.Replace("    Image path: $warpPath`r`n", '') -ExpectedPath $warpPath -ExpectedVersion $warpVersion } 'Module evidence must include the loaded DLL path.'
+    Assert-Rejected { Get-VictoryWarpModuleEvidence -Output $warpModule.Replace("    File version: $warpVersion`r`n", '') -ExpectedPath $warpPath -ExpectedVersion $warpVersion } 'Module evidence must include the loaded file version.'
+    $otherPath = $warpModule.Replace($warpPath, 'C:\Windows\System32\d3d10warp.dll')
+    $otherVersion = $warpModule.Replace($warpVersion, '10.0.26100.33648')
+    Assert-Rejected { Get-VictoryWarpModuleEvidence -Output $otherPath -ExpectedPath $warpPath -ExpectedVersion $warpVersion } 'The wrong loaded WARP path must fail even with the expected version.'
+    Assert-Rejected { Get-VictoryWarpModuleEvidence -Output $otherVersion -ExpectedPath $warpPath -ExpectedVersion $warpVersion } 'The wrong loaded WARP version must fail even with the expected path.'
+    Assert-Rejected { Get-VictoryWarpModuleEvidence -Output ($warpModule + $otherPath) } 'Conflicting loaded module paths must fail even without a pinned expectation.'
+    Assert-Rejected { Get-VictoryWarpModuleEvidence -Output ($warpModule + $otherVersion) } 'Conflicting loaded module versions must fail even without a pinned expectation.'
+    Assert-Rejected { Get-VictoryWarpModuleEvidence -Output $warpModule -ExpectedPath $warpPath } 'A runtime requirement must specify both path and version.'
+    Write-Host 'Diagnostics harness checks passed: external paths, argument quoting, environment isolation, dual-stream capture, nonzero exit, timeout, no overwrite, explicit semantic coverage, native debugger failure propagation and loaded WARP identity.'
 } finally {
     [Environment]::SetEnvironmentVariable('VICTORY_DIAG_TEST_INHERITED', $oldInherited)
     if (Test-Path -LiteralPath (Join-Path $temp 'linked-copy')) { Remove-Item -LiteralPath (Join-Path $temp 'linked-copy') -Force }

@@ -591,7 +591,7 @@ impl Shader {
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,
         });
-        let hash = [0u8; 20];
+        let hash = container::shader_hash(&bitcode);
         let psg1 = container::signature(&self.prims, false);
         let mut parts: Vec<(&[u8; 4], &[u8])> =
             vec![(b"SFI0", &sfi0), (b"ISG1", &isg1), (b"OSG1", &osg1)];
@@ -649,5 +649,60 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dxbc::{Container, FourCC};
+    use crate::dxil::DxilProgram;
+
+    fn color(value: f32) -> Vec<u8> {
+        let mut s = Shader::new(true);
+        s.outputs.push(SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 1,
+            usage: 1,
+            half: false,
+        });
+        let args = [s.m.i32(0), s.m.i32(0), s.m.i8(0), s.m.f32(value.to_bits())];
+        s.op(
+            s.entry,
+            "storeOutput.f32",
+            Attr::NoUnwind,
+            s.t.void,
+            5,
+            &args,
+        );
+        s.m.terminate(s.entry, super::super::bitcode::Term::Ret);
+        s.finish()
+    }
+
+    #[test]
+    fn emitted_shader_hashes_identify_the_program() {
+        let first = color(0.25);
+        let second = color(0.5);
+        assert_eq!(first, color(0.25), "the same program stays deterministic");
+        let mut hashes = Vec::new();
+        for bytes in [&first, &second] {
+            let parsed = Container::parse(bytes).unwrap();
+            let program = DxilProgram::parse(parsed.part(FourCC::DXIL).unwrap().data).unwrap();
+            let hash = parsed.part(FourCC::HASH).unwrap().data;
+            assert_eq!(hash, &container::shader_hash(program.bitcode));
+            assert_ne!(&hash[4..], &[0; 16]);
+            assert_eq!(parsed.digest, container::hash(&bytes[20..]));
+            hashes.push(hash);
+        }
+        assert_ne!(
+            hashes[0], hashes[1],
+            "different programs need different hashes"
+        );
     }
 }

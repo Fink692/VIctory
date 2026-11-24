@@ -293,6 +293,28 @@ pub(crate) fn build(parts: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
     out
 }
 
+/// The HASH part: flags=0 (no source information), then standard MD5 of
+/// the LLVM program bitcode. This is separate from the DXBC signature.
+/// Matches DXC's SerializeDxilContainerForModule in
+/// lib/DxilContainer/DxilContainerAssembler.cpp.
+pub(crate) fn shader_hash(bitcode: &[u8]) -> [u8; 20] {
+    let (blocks, remainder) = bitcode.as_chunks::<64>();
+    let mut tail = [0u8; 128];
+    tail[..remainder.len()].copy_from_slice(remainder);
+    tail[remainder.len()] = 0x80;
+    let end = if remainder.len() < 56 { 64 } else { 128 };
+    tail[end - 8..end].copy_from_slice(&(bitcode.len() as u64).wrapping_mul(8).to_le_bytes());
+    let mut state = [0x6745_2301u32, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
+    for block in blocks.iter().chain(tail[..end].as_chunks::<64>().0) {
+        md5_block(&mut state, block);
+    }
+    let mut out = [0; 20];
+    for (o, s) in out[4..].as_chunks_mut::<4>().0.iter_mut().zip(state) {
+        o.copy_from_slice(&s.to_le_bytes());
+    }
+    out
+}
+
 /// The container hash D3D12 checks: MD5 whose last block carries the bit
 /// count first and `2 × bytes + 1` last instead of standard padding.
 pub(crate) fn hash(data: &[u8]) -> [u8; 16] {
@@ -376,5 +398,90 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    #[test]
+    fn shader_hash_uses_standard_md5_padding() {
+        let vectors = [
+            (Vec::new(), "d41d8cd98f00b204e9800998ecf8427e"),
+            (b"abc".to_vec(), "900150983cd24fb0d6963f7d28e17f72"),
+            (vec![b'a'; 55], "ef1772b6dff9a122358552954ad0df65"),
+            (vec![b'a'; 56], "3b0c8ac703f828b04c6c197006d17218"),
+            (vec![b'a'; 63], "b06521f39153d618550606be297466d5"),
+            (vec![b'a'; 64], "014842d480b571495a4a0363793f7367"),
+            (vec![b'a'; 65], "c743a45e0d2e6a95cb859adae0248435"),
+            (vec![b'a'; 120], "5f61c0ccad4cac44c75ff505e1f1e537"),
+            (vec![b'a'; 128], "e510683b3f5ffe4093d021808bc6ff70"),
+        ];
+        for (input, expected) in vectors {
+            let actual = shader_hash(&input);
+            assert_eq!(&actual[..4], &[0; 4]);
+            let hex: String = actual[4..].iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(hex, expected, "{} bytes", input.len());
+            assert_ne!(&actual[4..], &hash(&input));
+        }
+    }
+
+    /// Compare our HASH payload to the requested official compiler for two
+    /// authored programs. No compiled fixture is stored.
+    #[test]
+    #[ignore = "requires an explicit official DXC executable"]
+    fn shader_hash_matches_official_dxc() {
+        use crate::dxbc::{Container, FourCC};
+        use crate::dxil::DxilProgram;
+        let compiler = std::env::var_os("VICTORY_DXC")
+            .expect("VICTORY_DXC must name the official DXC executable");
+        struct Temp(std::path::PathBuf);
+        impl Drop for Temp {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp = Temp(std::env::temp_dir().join(format!(
+            "victory-shader-hash-{}-{stamp}",
+            std::process::id()
+        )));
+        std::fs::create_dir(&temp.0).unwrap();
+        let source = temp.0.join("reference.hlsl");
+        let output = temp.0.join("reference.dxil");
+        std::fs::write(
+            &source,
+            "RWByteAddressBuffer target : register(u0);\n\
+             [numthreads(1, 1, 1)] void main() { target.Store(0, VALUE); }\n",
+        )
+        .unwrap();
+        let mut hashes = Vec::new();
+        for value in [1, 2] {
+            let result = std::process::Command::new(&compiler)
+                .args(["-T", "cs_6_6", "-E", "main", "-D"])
+                .arg(format!("VALUE={value}"))
+                .arg("-Fo")
+                .arg(&output)
+                .arg(&source)
+                .output()
+                .expect("could not run VICTORY_DXC");
+            assert!(
+                result.status.success(),
+                "DXC compilation: {}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let bytes = std::fs::read(&output).unwrap();
+            let container = Container::parse(&bytes).unwrap();
+            let program = DxilProgram::parse(container.part(FourCC::DXIL).unwrap().data).unwrap();
+            let official = container.part(FourCC::HASH).unwrap().data;
+            let ours = shader_hash(program.bitcode);
+            assert_eq!(&ours, official);
+            hashes.push(ours);
+        }
+        assert_ne!(hashes[0], hashes[1]);
+        eprintln!(
+            "VICTORY_SHADER_HASH_RESULT=matched programs={}",
+            hashes.len()
+        );
     }
 }

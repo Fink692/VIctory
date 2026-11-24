@@ -5,7 +5,7 @@
 //! user data the translated shaders read, the host copies of the buffers
 //! and descriptors they read, and the states of the textures involved.
 //! State the host keeps across draws (viewports, scissors, blend factor,
-//! stencil reference, topology, targets) is set on the host list as the
+//! stencil reference, depth bounds, topology, targets) is set on the host list as the
 //! title sets it.
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1233,4 +1233,20 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+/// Dynamic depth bounds persist across draws and PSO switches. A native
+/// command-list reset restores the specified default range of [0, 1].
+pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
+    if !crate::host::host().is_some_and(|h| h.depth_bounds_supported().unwrap_or(false)) {
+        // Enabled depth-bounds pipelines are rejected during creation.
+        // Do not record an unsupported native command for disabled PSOs.
+        return;
+    }
+    let Ok(native) = list.list.cast::<ID3D12GraphicsCommandList1>() else {
+        once!("host command list cannot set depth bounds");
+        return;
+    };
+    // SAFETY: an open list on a device with the optional feature.
+    unsafe { native.OMSetDepthBounds(min, max) };
 }

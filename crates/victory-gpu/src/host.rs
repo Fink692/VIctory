@@ -38,6 +38,7 @@ const RTV_RING: u32 = 1024;
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     waves: OnceLock<WaveSupport>,
+    depth_bounds: OnceLock<Result<bool, String>>,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -251,6 +252,7 @@ fn create() -> windows::core::Result<Host> {
         Ok(Host {
             device,
             waves: OnceLock::new(),
+            depth_bounds: OnceLock::new(),
             queue,
             fence,
             submitted: Mutex::new(0),
@@ -377,6 +379,7 @@ mod tests {
             factory.EnumWarpAdapter::<IDXGIAdapter>()
         };
         let Ok(raw) = raw else { return };
+        // SAFETY: DXGI returned this live adapter and writes the returned descriptor.
         let desc = unsafe { raw.cast::<IDXGIAdapter1>().unwrap().GetDesc1().unwrap() };
         eprintln!(
             "EnumWarpAdapter: vendor={:#x}, flags={:#x}",
@@ -487,13 +490,10 @@ const SCRATCH_CHUNK: u64 = 4 << 20;
 
 /// One piece of submission-time work, in recorded order.
 enum Step {
-    /// A copy into title memory (destination, source, bytes): the title's
-    /// buffer copies, which later refreshes must see.
-    Copy(usize, usize, usize),
     /// A copy of title memory into the list's own upload memory.
     Fill(usize, usize, usize),
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
-    /// once per submission, whichever lists ask, until a `Copy` or `Run`
+    /// once per submission, whichever lists ask, until a `Run`
     /// intervenes.
     Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Work that may write title memory.
@@ -503,7 +503,7 @@ enum Step {
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
-    /// whichever lists sample it, until a `Copy` or `Run` intervenes.
+    /// whichever lists sample it, until a `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
 }
 
@@ -581,6 +581,7 @@ impl Host {
         }
         self.mesh_shaders();
         self.i64_image_atomics();
+        let _ = self.depth_bounds_supported();
     }
 
     fn wave_support(&self) -> &WaveSupport {
@@ -608,6 +609,37 @@ impl Host {
     /// loses the requirement behind an opaque E_INVALIDARG error.
     pub(crate) fn require_wave_size(&self, lanes: u32) -> Result<(), String> {
         self.wave_support().require(lanes)
+    }
+
+    /// Depth bounds are optional even when the device supports newer
+    /// shader models. Keep the query tied to this device, not a process-wide
+    /// assumption, and never silently omit an enabled test from a PSO.
+    pub(crate) fn depth_bounds_supported(&self) -> Result<bool, String> {
+        self.depth_bounds
+            .get_or_init(|| {
+                let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
+                // SAFETY: OPTIONS2 receives its matching writable structure.
+                let query = unsafe {
+                    self.device.CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS2,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                };
+                let supported = query.is_ok() && options.DepthBoundsTestSupported.as_bool();
+                tracing::info!(
+                    queried = query.is_ok(),
+                    supported,
+                    "host depth-bounds capability"
+                );
+                query.map(|()| supported).map_err(|error| {
+                    format!(
+                        "OPTIONS2 query failed ({:#010x}): {error}",
+                        error.code().0 as u32
+                    )
+                })
+            })
+            .clone()
     }
 
     /// Query results and bottom-of-pipe GPU timestamps use this clock.
@@ -1453,15 +1485,6 @@ impl HostList {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Copies `len` bytes from `src` to `dst` when the list is submitted.
-    pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
-        let mut deferred = self.deferred();
-        deferred
-            .copies
-            .push(Step::Copy(dst as usize, src as usize, len));
-        deferred.refreshed.clear();
-    }
-
     /// Copies `len` bytes of title memory at `src` into the list's upload
     /// memory at `dst` when the list is submitted.
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
@@ -1504,17 +1527,6 @@ impl HostList {
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         self.deferred().writes.push((dst as usize, what, bytes));
-    }
-
-    /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset.
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
-    pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        let (buffer, data) = host.upload_buffer(size)?;
-        name(&buffer, || format!("list upload {size:#x}"));
-        self.deferred().uploads.push(buffer.clone());
-        Some((buffer, data))
     }
 
     /// `len` bytes of upload memory (256-byte aligned) until the list is
@@ -1611,16 +1623,6 @@ impl HostList {
         for step in &self.deferred().copies {
             let started = std::time::Instant::now();
             let copied = match step {
-                &Step::Copy(dst, src, len) => {
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        add(C::Copies, 1);
-                        add(C::CopyBytes, len as u64);
-                    }
-                    batch.title_written();
-                    copy_mapped(dst as *mut u8, src as *const u8, len, true);
-                    len
-                }
                 &Step::Fill(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
                     {

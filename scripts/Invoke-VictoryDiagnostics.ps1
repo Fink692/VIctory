@@ -14,6 +14,7 @@ param(
     [string[]]$ShaderPath = @(),
     [string]$OutputRoot = (Join-Path ([IO.Path]::GetTempPath()) 'victory-diagnostics'),
     [string]$FormatBaseRef = 'origin/main',
+    [string]$WarpPackagePath,
     [ValidateSet('series-x', 'series-s')][string[]]$ConsoleMode = @('series-x'),
     [ValidateRange(0, 1048576)][uint32[]]$LoopLimit = @(0),
     [ValidatePattern('^[0-9a-fA-F]{16}$')][string[]]$SkipPipeline = @(),
@@ -32,6 +33,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 if (-not $IsWindows) { throw 'VIctory runtime diagnostics require Windows x64.' }
 . (Join-Path $PSScriptRoot 'Diagnostics.Common.ps1')
+. (Join-Path $PSScriptRoot 'Initialize-VictoryWarp.ps1')
 if ($DumpTargets -and $CaptureFrames.Count -eq 0) { throw '-DumpTargets requires an explicit -CaptureFrames list.' }
 if ($ConsoleMode.Count -eq 0 -or $LoopLimit.Count -eq 0) { throw 'The experiment matrix must have a console mode and loop limit.' }
 if ($GameExe) {
@@ -111,8 +113,12 @@ try {
     $summary['os'] = [Runtime.InteropServices.RuntimeInformation]::OSDescription
     $summary['powershell'] = $PSVersionTable.PSVersion.ToString()
     $summary['video_controllers'] = @(Get-CimInstance Win32_VideoController | Select-Object Name, PNPDeviceID, DriverVersion, DriverDate)
+    $warpPackage = $null
+    if (-not $SkipChecks -or (-not $Hardware -and ($GameExe -or $ShaderPath.Count -gt 0))) {
+        $warpPackage = Get-VictoryWarpPackage -CacheDirectory (Join-Path $report 'warp-package') -PackagePath $WarpPackagePath
+    }
     if (-not $SkipChecks) {
-        & (Join-Path $PSScriptRoot 'Test-Victory.ps1') -OutputRoot (Join-Path $report 'checks') -FormatBaseRef $FormatBaseRef -RequireGpu
+        & (Join-Path $PSScriptRoot 'Test-Victory.ps1') -OutputRoot (Join-Path $report 'checks') -FormatBaseRef $FormatBaseRef -RequireGpu -WarpPackagePath $warpPackage.package_path
     }
     $build = Invoke-VictoryProcess -Executable 'cargo' -Arguments @('build', '--locked', '--profile', 'diag', '-p', 'victory', '--features', 'diagnostics') -WorkingDirectory $script:VictoryRepoRoot -LogPrefix (Join-Path $report 'build') -Environment $environment -TimeoutSeconds 1200
     Assert-VictoryProcessSucceeded $build 'diagnostics build'
@@ -120,6 +126,18 @@ try {
     $summary['binary_sha256'] = (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant()
     $summary['build_profile'] = 'diag'
     $summary['build_features'] = @('diagnostics')
+    if (-not $Hardware -and ($GameExe -or $ShaderPath.Count -gt 0)) {
+        $application = Join-Path $report 'application'
+        [void][IO.Directory]::CreateDirectory($application)
+        $runtimeBinary = Join-Path $application 'victory.exe'
+        Copy-Item -LiteralPath $binary -Destination $runtimeBinary
+        $symbols = [IO.Path]::ChangeExtension($binary, '.pdb')
+        if (Test-Path -LiteralPath $symbols) { Copy-Item -LiteralPath $symbols -Destination $application }
+        if ((Get-FileHash -LiteralPath $runtimeBinary -Algorithm SHA256).Hash.ToLowerInvariant() -ne $summary.binary_sha256) { throw 'The isolated diagnostics executable differs from the built executable.' }
+        $summary['warp_runtime'] = Initialize-VictoryWarp -CacheDirectory (Join-Path $report 'warp-package') -ApplicationDirectory @($application) -PackagePath $warpPackage.package_path -ReportPath (Join-Path $report 'warp-runtime.json')
+        $binary = $runtimeBinary
+    }
+    $summary['binary_path'] = $binary
     if ($ShaderPath.Count -gt 0) {
         $scanEnvironment = $environment.Clone()
         if (-not $Hardware) { $scanEnvironment.VICTORY_WARP = '1' }

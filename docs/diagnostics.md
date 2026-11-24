@@ -9,9 +9,35 @@ separate so fixes can be compared against the same scenario.
 
 Use Windows x64, the MSVC C++ build tools and Windows SDK, the repository's
 pinned Rust toolchain, and PowerShell 7.2 or newer (`pwsh`). The strict GPU
-test gate also needs the SDK's `x64/dxil.dll` and a WARP adapter able to
+test gate also needs the SDK's `x64/dxil.dll`, sibling `dxc.exe`, and a WARP adapter able to
 create the synthetic shader-model 6.6 pipeline. A missing prerequisite is a
 failure of this gate, rather than a passing skipped GPU test.
+
+The supported software-validation runtime is Microsoft.Direct3D.WARP
+**1.0.22** (DLL version **1.0.22.0**). `Test-Victory.ps1` automatically
+downloads the pinned official NuGet package, verifies its hashes and DLL
+version, and places the runtime beside the Cargo test executables in
+`target/debug/deps`. It records the installed files in `warp-runtime.json`.
+CI's native controls also require the actual loaded DLL path/version to
+match that installation. This does not change Windows' installed renderer.
+
+The controlled [runtime comparison](https://github.com/Fink692/VIctory/actions/runs/45429956002)
+used identical executable bytes and test arguments. Inbox WARP
+`10.0.26100.33648` failed the concurrent shader/VALU controls and ignored
+depth bounds with ordinary depth testing disabled. WARP `1.0.22.0` passed
+all three concurrent runs (83 tests each), seven isolated VALU tests, 496
+LDS cases, the compressed-copy control and all 14 depth cases. Both drivers
+had clean depth-fixture validation except for the two intentionally
+inverted intervals. This establishes the software baseline for these
+controls; physical GPU and title results remain separate.
+
+For an offline installation, pass `-WarpPackagePath` with an existing copy
+of the exact pinned `.nupkg` to either runner. The same integrity checks
+apply. `Initialize-VictoryWarp.ps1` also supports explicit application
+directories. Matching files are reused; a different existing runtime is
+rejected unless that helper is explicitly given
+`-ExistingDllPolicy ReplaceDifferent`. The downloaded development runtime
+and symbols are local dependencies and are excluded from CI uploads.
 
 ## Check a source change without game files
 
@@ -44,13 +70,26 @@ gate. These isolated checks request the D3D12 debug layer and run immediately
 after the basic WARP pipeline check. Their separate logs and flushed phase
 markers distinguish validator, pipeline and dispatch failures before the
 parallel workspace suite runs.
+
+The shader-identity check compiles two authored programs with the SDK's DXC
+and compares their `HASH` payloads to our bitcode digest. The LDS matrix
+independently validates 168 byte/halfword shared-memory
+programs and requires 496 semantic dispatch cases per WARP adapter. These
+checks cannot pass through an unsupported-adapter skip. Texture-copy checks
+verify same-submission GPU input, partial readback with guard bytes,
+cross-list ordering and same-texture mip copies. The optional depth-bounds
+feature records either all 14 measured cases or `unsupported` with zero
+cases; a capability-query error is a failure.
+
 It saves a `checks.json` report and individual process logs under a unique
 directory in the system temporary folder. `-OutputRoot D:\victory-runs`
 selects another external directory. Omitting `-RequireGpu` permits the
 existing optional GPU tests to skip on machines without their prerequisites;
-that result does not satisfy the strict GPU gate.
+that result does not satisfy the strict GPU gate. Independent checks keep
+running after a failure, and each records its own status and error. The
+final status remains failed if any required check failed.
 
-CI runs the same strict command on `windows-2025` for pull requests and
+CI adds `-NativeShaderDebug` to the strict command on `windows-2025` for pull requests and
 pushes to `main`, with read-only repository permissions. It uploads only the
 asset-free check logs and metadata. Existing console-SDK differential tests
 and ignored tests requiring reference game data are **not** exercised by
@@ -59,6 +98,70 @@ An independent `ubuntu-24.04` job runs all platform-independent workspace
 tests, checks all targets/features, tests the diagnostics harness and checks
 the asset policy. Windows-only tests remain the responsibility of the
 Windows job; Linux success is not a Windows runtime result.
+
+### Capture native regressions
+
+The post-merge inbox-WARP run exposed an access violation in the concurrent
+shader suite even after isolated checks passed. The pinned runtime resolved
+that failure in the controlled comparison. To repeat the concurrent controls
+and retain native diagnostics for any regression, install the Windows SDK
+Debugging Tools and run:
+
+```powershell
+pwsh -NoProfile -File scripts/Test-Victory.ps1 -RequireGpu -NativeShaderDebug
+```
+
+`Test-NativeShader.ps1` builds the exact shader test executable and runs it
+three times under x64 CDB with four test threads. Second-chance access
+violations capture the exception, registers, thread stacks and loaded-module
+names. After any concurrent failure, separate child processes also run the
+exact LDS result test and the seven existing VALU tests, preserving all
+failures and per-case LDS traces. The normal concurrent workspace test
+still runs afterward. A missing
+debugger, timeout, native exception or incomplete Rust result fails the gate.
+CI preserves `.native.log` and `native-shader.json` alongside the other
+synthetic logs; no process memory dumps are written. `-CdbPath`, `-Attempts`
+and `-TestThreads` are available when invoking the script directly.
+
+The same flag also runs `Test-NativeGpu.ps1`. It launches the compressed
+texture-copy and depth-bounds controls in separate CDB processes, with the
+D3D12 debug layer and flushed operation traces. It captures both access
+violations and native aborts, and records each result in `native-gpu.json`.
+The depth control prints every original case and, on a mismatch, compares
+title state updates with direct native calls and ordinary depth tests.
+These extra probes do not change the required results. Independent checks
+continue after a failure so their evidence is retained; any failed check
+still fails the overall command.
+
+### Compare software-renderer versions
+
+`Test-WarpComparison.ps1` replays the two native reports against the Windows
+inbox WARP and Microsoft's pinned
+[WARP 1.0.22 package](https://www.nuget.org/packages/Microsoft.Direct3D.WARP/1.0.22).
+Run the native checks first, then supply their exact report paths:
+
+```powershell
+pwsh -NoProfile -File scripts/Test-WarpComparison.ps1 `
+  -RepositoryRoot (Get-Location).Path `
+  -ShaderReportPath 'D:\VIctory-reports\native-shader.json' `
+  -GpuReportPath 'D:\VIctory-reports\native-gpu.json'
+```
+
+The comparison verifies the package and x64 DLL hashes, copies the same
+test executable bytes into separate external application directories, and
+preserves the original test arguments and concurrency. Each child gets a
+fresh cache. The debugger must confirm the expected loaded DLL path and
+version before a result is accepted. `warp-comparison.json` records both
+sets of results; a passing newer-runtime control cannot erase an inbox
+failure. The existing target directory and installed Windows files are
+unchanged. The package is for testing and development; its binaries and
+symbols are excluded from the repository and CI artifacts.
+
+Normal CI runs the complete gate with pinned WARP. A manual workflow run
+can additionally select `compare_inbox_warp`; that diagnostic comparison
+still fails when an inbox control fails. Its known failures are retained
+as evidence rather than reclassified as passing tests. Neither workflow
+establishes physical GPU compatibility or title rendering.
 
 ### Optional independent DXIL validation
 
@@ -72,7 +175,21 @@ $env:VICTORY_DXV = 'D:\tools\dxc\bin\x64\dxv.exe'
 cargo test --locked -p victory-shader --all-features `
   emit::atomic_tests::image_atomics_translate_in_both_widths_and_return_modes `
   -- --exact --nocapture
+cargo test --locked -p victory-shader --all-features `
+  emit::lds_tests::lds_subword_programs_translate_and_validate `
+  -- --exact --nocapture
 Remove-Item Env:VICTORY_DXV
+```
+
+The independent shader-hash comparison is explicitly ignored by ordinary
+test discovery and can be required with an official compiler:
+
+```powershell
+$env:VICTORY_DXC = 'D:\tools\dxc\bin\x64\dxc.exe'
+cargo test --locked -p victory-shader --all-features `
+  emit::container::tests::shader_hash_matches_official_dxc `
+  -- --ignored --exact --nocapture
+Remove-Item Env:VICTORY_DXC
 ```
 
 On Linux, set `VICTORY_DXV` to the absolute path of the Linux `dxv` binary
@@ -138,6 +255,11 @@ and check that previously working programs retain their results.
 The runner launches no title unless `-GameExe` is provided. Each invocation
 creates a unique report directory; each matrix case gets independent cache
 and save directories. It uses WARP unless `-Hardware` is explicitly supplied.
+Software shader scans and title runs use an identical copy of the built
+executable in the report's `application` directory, beside the verified
+pinned WARP runtime. Its executable hash and prepared runtime files are
+recorded; the title input remains at the supplied external path. Hardware
+runs use the normal built executable and actual adapter diagnostics.
 
 ```powershell
 pwsh -NoProfile -File scripts/Invoke-VictoryDiagnostics.ps1 `

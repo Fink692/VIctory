@@ -534,14 +534,13 @@ extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct CopyLocation {
-    resource: This,
-    kind: u32,
-    footprint: crate::resource::PlacedFootprint,
+    pub(crate) resource: This,
+    pub(crate) kind: u32,
+    pub(crate) footprint: crate::resource::PlacedFootprint,
 }
 
-/// Texture to texture on the GPU; buffer to texture through an upload
-/// buffer filled at submission. Texture to buffer (read back) is not done
-/// yet.
+/// Texture copies stay in the GPU stream in both directions. Footprint
+/// buffers are staged on the GPU, preserving preceding writes and padding.
 extern "system" fn copy_texture_region(
     this: This,
     dst: *const CopyLocation,
@@ -553,93 +552,19 @@ extern "system" fn copy_texture_region(
 ) {
     #[cfg(windows)]
     {
-        use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
-        use windows::core::Interface;
-        const FOOTPRINT: u32 = 1;
-        // SAFETY: the title passes both locations (null is tolerated).
-        let (Some(list), Some(&dst), Some(&src)) =
+        // SAFETY: the title supplies both copy locations and an optional box.
+        let (Some(list), Some(dst), Some(src)) =
             (host_list(this), unsafe { dst.as_ref() }, unsafe {
                 src.as_ref()
             })
         else {
             return;
         };
-        let Some(to) = crate::resource::host_resource(dst.resource) else {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
-            return;
-        };
-        let mut from = src;
-        let _upload; // keeps the source alive while this call records it
-        #[cfg(feature = "diagnostics")]
-        let mut read = None;
-        if src.kind == FOOTPRINT {
-            let (Some(host), Some(bytes)) = (crate::host::host(), src.footprint.bytes()) else {
-                return;
-            };
-            let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
-                return;
-            };
-            let Some((buffer, staging)) = list.upload(host, bytes) else {
-                return;
-            };
-            list.defer_copy(staging, data, bytes as usize);
-            from.resource = buffer.as_raw().cast_const().cast();
-            from.footprint.offset = 0;
-            #[cfg(feature = "diagnostics")]
-            {
-                // SAFETY: a live buffer.
-                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
-            }
-            _upload = buffer;
-        } else {
-            let Some(texture) = crate::resource::host_resource(src.resource) else {
-                return;
-            };
-            ensure_state(list, src.resource, COPY_SOURCE);
-            from.resource = texture.as_raw().cast_const().cast();
+        // SAFETY: the optional box is null or points to the title's six valid coordinates.
+        let region = unsafe { source_box.as_ref() }.copied();
+        if let Err(reason) = crate::texture_copy::record(list, dst, [x, y, z], src, region) {
+            tracing::warn!(reason, "texture copy was rejected");
         }
-        ensure_state(list, dst.resource, COPY_DEST);
-        crate::texture::host_written(dst.resource);
-        let mut to_location = dst;
-        to_location.resource = to.as_raw().cast_const().cast();
-        let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
-        #[cfg(feature = "diagnostics")]
-        {
-            let text = || {
-                // SAFETY: a live texture; the box is the title's or null.
-                let (d, b) = unsafe { (to.GetDesc(), host_box.map(|b| *b)) };
-                format!(
-                    "copy to {:?} {}x{} f{} sub/kind {} at {x},{y},{z} from {:?} kind {} footprint {:?} box {b:?}",
-                    dst.resource,
-                    d.Width,
-                    d.Height,
-                    d.Format.0,
-                    dst.kind,
-                    src.resource,
-                    src.kind,
-                    (src.kind == FOOTPRINT).then_some(src.footprint)
-                )
-            };
-            match read {
-                Some(range) => list.note_read(text, range),
-                None => list.note_op(text),
-            }
-        }
-        const _: () =
-            assert!(size_of::<CopyLocation>() == size_of::<D3D12_TEXTURE_COPY_LOCATION>());
-        // SAFETY: an open list; both locations in the host's layout, naming
-        // live resources; the box is the title's (same layout).
-        unsafe {
-            list.list.CopyTextureRegion(
-                (&raw const to_location).cast(),
-                x,
-                y,
-                z,
-                (&raw const from).cast(),
-                host_box,
-            )
-        };
     }
     #[cfg(not(windows))]
     let _ = (this, dst, x, y, z, src, source_box);
@@ -959,9 +884,25 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
 }
 
 /// Draw state the host has no use for (root signatures: ours come with
-/// the pipeline; depth bounds, depth order and shading rate hints): any
+/// the pipeline; depth order and shading rate hints): any
 /// arguments, nothing returned.
 extern "system" fn ignored_state(_: This) {}
+
+/// D3D12 converts NaN depth bounds to zero, but does not sort or clamp
+/// the range. An inverted interval must continue to reject every sample.
+fn depth_bounds_range(min: f32, max: f32) -> (f32, f32) {
+    let value = |x: f32| if x.is_nan() { 0.0 } else { x };
+    (value(min), value(max))
+}
+
+extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
+    let (min, max) = depth_bounds_range(min, max);
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        crate::draw::depth_bounds(list, min, max);
+    }
+    let _ = (this, min, max);
+}
 
 /// The title's draw state (decision 0007, step 3), kept for its draws or
 /// set on the host list at once. Without a host GPU these do nothing.
@@ -1400,7 +1341,7 @@ const METHODS: [(usize, *const ()); 52] = [
     (52, clear_rtv as *const ()),                 // 0x1a0
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
-    (68, ignored_state as *const ()),             // 0x220 depth bounds
+    (68, depth_bounds as *const ()),              // 0x220 depth bounds
     (69, write32 as *const ()),                   // 0x228
     (70, write64 as *const ()),                   // 0x230
     (71, wait_value as *const ()),                // 0x238, 32 bits
@@ -1479,6 +1420,28 @@ mod tests {
     use crate::object::slot;
 
     #[test]
+    fn depth_bounds_preserve_order_and_convert_nan_only() {
+        assert_eq!(depth_bounds_range(f32::NAN, 0.5), (0.0, 0.5));
+        assert_eq!(depth_bounds_range(0.5, f32::NAN), (0.5, 0.0));
+        assert_eq!(depth_bounds_range(0.75, 0.25), (0.75, 0.25));
+        assert_eq!(depth_bounds_range(-1.0, 2.0), (-1.0, 2.0));
+        assert_eq!(
+            depth_bounds_range(f32::NEG_INFINITY, f32::INFINITY),
+            (f32::NEG_INFINITY, f32::INFINITY)
+        );
+        assert_eq!(
+            depth_bounds_range(-0.0, 1.0).0.to_bits(),
+            (-0.0f32).to_bits()
+        );
+    }
+
+    #[test]
+    fn both_console_list_layouts_route_depth_bounds() {
+        assert_eq!(LIST_FUNCTIONS.0[68], depth_bounds as *const ());
+        assert_eq!(NEWER_LIST_FUNCTIONS.0[70], depth_bounds as *const ());
+    }
+
+    #[test]
     fn indirect_ranges_stay_inside_the_named_resource() {
         assert_eq!(indirect_address(0x1000, 48, 16, 32), Some(0x1010));
         assert_eq!(indirect_address(0x1000, 48, 20, 32), None);
@@ -1526,8 +1489,8 @@ mod tests {
             "not a power of two"
         );
         assert_eq!(reset(list, allocator, null), S_OK);
-        // SAFETY: the list is ours.
         assert!(
+            // SAFETY: the test owns this live list.
             unsafe { &(*list.cast::<List>()).uploads }
                 .lock()
                 .unwrap()
