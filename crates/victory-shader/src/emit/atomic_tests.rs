@@ -256,7 +256,7 @@ fn image_atomics_translate_in_both_widths_and_return_modes() {
     }
 }
 
-fn validate_dxv(exe: &std::ffi::OsStr, dxil: &[u8]) {
+pub(super) fn validate_dxv(exe: &std::ffi::OsStr, dxil: &[u8]) {
     use std::io::Write;
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

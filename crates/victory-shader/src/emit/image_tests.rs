@@ -134,6 +134,60 @@ fn constant_sample_offsets_translate_only_in_the_host_range() {
     }
 }
 
+/// A real rasterizing vertex program. `host::stub_vs` only helps create a
+/// pipeline: its all-zero position makes a degenerate triangle.
+fn fullscreen_vs() -> HostShader {
+    use super::bitcode::{Attr, Term};
+    let mut s = super::shader::Shader::new(false);
+    let position = SigElement {
+        name: "POSITION".into(),
+        index: 0,
+        kind: 0,
+        comp: 9,
+        interp: 0,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 15,
+        half: false,
+    };
+    s.inputs.push(position.clone());
+    s.outputs.push(SigElement {
+        name: "SV_Position".into(),
+        kind: 3,
+        interp: 4,
+        ..position
+    });
+    let b = s.entry;
+    for col in 0..4 {
+        let args = [s.m.i32(0), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
+        let value = s.op(b, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args);
+        let args = [s.m.i32(0), s.m.i32(0), s.m.i8(col), value];
+        s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
+    }
+    s.m.terminate(b, Term::Ret);
+    HostShader {
+        stage: HwStage::Vs,
+        dxil: s.finish(),
+        user_data: Vec::new(),
+        samplers: Vec::new(),
+        static_samplers: Vec::new(),
+        root_cbvs: Vec::new(),
+        root_srvs: Vec::new(),
+    }
+}
+
+#[test]
+fn sample_offset_raster_fixture_validates() {
+    let vs = fullscreen_vs();
+    assert!(vs.user_data.is_empty());
+    let c = crate::Container::parse(&vs.dxil).unwrap();
+    assert!(c.part(crate::FourCC::ISG1).is_some());
+    if let Some(exe) = std::env::var_os("VICTORY_DXV") {
+        super::atomic_tests::validate_dxv(&exe, &vs.dxil);
+    }
+}
+
 #[test]
 #[cfg(windows)]
 fn constant_sample_offsets_read_the_expected_texels() {
@@ -164,7 +218,8 @@ fn constant_sample_offsets_read_the_expected_texels() {
         for [x, y, z] in [[0, 0, 0], [1, 2, 0], [-1, -2, 0], [-8, 7, 0], [7, -8, 0]] {
             let mut ps = sample_offset(Some(offset_word([x, y, z])), 1).unwrap();
             validator.validate(&mut ps.dxil).unwrap();
-            let vs = super::host::stub_vs(&ps).unwrap();
+            let mut vs = fullscreen_vs();
+            validator.validate(&mut vs.dxil).unwrap();
             let (root, pso) = host.pipeline(&vs, &ps).unwrap();
             let got = host
                 .draw(
@@ -177,8 +232,10 @@ fn constant_sample_offsets_read_the_expected_texels() {
                         ],
                         textures: &[(32, 32, &texels)],
                         samplers: &samplers,
-                        vertices: &[],
-                        stride: 0,
+                        vertices: &[
+                            -1.0, -1.0, 0.5, 1.0, -1.0, 3.0, 0.5, 1.0, 3.0, -1.0, 0.5, 1.0,
+                        ],
+                        stride: 16,
                         size: (4, 4),
                         mesh_groups: 0,
                     },
