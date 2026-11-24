@@ -556,6 +556,48 @@ fn gpu_rectangles_observe_copies_formats_and_rebind_draw_state() {
         );
     }
     run_fixture(&half, &validation);
+    // Independent IEEE nearest-even truth table for v0 + v2 - v1.
+    // Spell out the expected integer sign instead of computing it with
+    // the same shader expression: only (-0, +0, -0) produces -0.
+    let zero_cases = [
+        ([0u32, 0, 0], 0u32),
+        ([0, 0, 0x8000_0000], 0),
+        ([0, 0x8000_0000, 0], 0),
+        ([0, 0x8000_0000, 0x8000_0000], 0),
+        ([0x8000_0000, 0, 0], 0),
+        ([0x8000_0000, 0, 0x8000_0000], 0x8000_0000),
+        ([0x8000_0000, 0x8000_0000, 0], 0),
+        ([0x8000_0000, 0x8000_0000, 0x8000_0000], 0),
+    ];
+    for (format, width, shift) in [(54, 2usize, 16), (41, 4, 0)] {
+        let stride = width + 3;
+        let mut zeros = Fixture {
+            label: format!("format-{format}-all-zero-sign-triples"),
+            bytes: vec![0x5b; 3 + zero_cases.len() * 3 * stride],
+            address_offset: 3,
+            count: (zero_cases.len() * 3) as u32,
+            first: 0,
+            stride: stride as u32,
+            elements: vec![(1, format)],
+        };
+        for (rectangle, (values, _)) in zero_cases.iter().enumerate() {
+            for (vertex, value) in values.iter().enumerate() {
+                let at = 3 + (rectangle * 3 + vertex) * stride + 1;
+                zeros.bytes[at..at + width]
+                    .copy_from_slice(&(*value >> shift).to_le_bytes()[..width]);
+            }
+        }
+        let expected = zeros.expected();
+        for (rectangle, (_, bits)) in zero_cases.iter().enumerate() {
+            let at = (rectangle * 6 + 5) * stride + 1;
+            assert_eq!(
+                &expected[at..at + width],
+                &(*bits >> shift).to_le_bytes()[..width],
+                "independent zero sign: format={format} triple={rectangle}"
+            );
+        }
+        run_fixture(&zeros, &validation);
+    }
     completed(&mut cases, &half.label, &validation);
     let many = positions(65, 2, 0);
     run_fixture(&many, &validation);

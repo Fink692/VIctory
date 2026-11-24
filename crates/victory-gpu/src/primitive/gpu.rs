@@ -330,6 +330,36 @@ fn shader(layout: &Layout) -> String {
         .unwrap();
         source.push_str("precise float sum = a + b;\nprecise float value = sum - c;\n");
         writeln!(source, "uint bits = encode_value(value, {kind}u);").unwrap();
+        if kind <= 1 {
+            // Native float arithmetic can canonicalize -0 despite precise
+            // evaluation. For three zero inputs the IEEE result is -0
+            // only for (-0 + -0) - +0. Preserve every zero-sign combination
+            // using the original integer bits, including F16's sign bit.
+            let sign = if kind == 0 { 0x8000_0000u32 } else { 0x8000u32 };
+            writeln!(source, "uint zero_a = source_bits(base + at, {bytes}u);").unwrap();
+            writeln!(
+                source,
+                "uint zero_b = source_bits(base + {}u + at, {bytes}u);",
+                u64::from(stride) * 2
+            )
+            .unwrap();
+            writeln!(
+                source,
+                "uint zero_c = source_bits(base + {stride}u + at, {bytes}u);"
+            )
+            .unwrap();
+            writeln!(
+                source,
+                "if (((zero_a | zero_b | zero_c) & ~{sign}u) == 0u) {{"
+            )
+            .unwrap();
+            writeln!(
+                source,
+                "bits = zero_a == {sign}u && zero_b == {sign}u && zero_c == 0u ? {sign}u : 0u;"
+            )
+            .unwrap();
+            source.push_str("}\n");
+        }
         source.push_str("result = (bits >> ((within - at) * 8u)) & 255u;\n}\n");
     }
     source.push_str("}\nreturn result;\n}\n");
