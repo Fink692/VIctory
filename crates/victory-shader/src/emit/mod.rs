@@ -87,6 +87,8 @@ mod diff_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 #[cfg(test)]
+mod lds_dword_tests;
+#[cfg(test)]
 mod lds_tests;
 mod lower;
 mod sampler;

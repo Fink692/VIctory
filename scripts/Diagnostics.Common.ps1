@@ -184,9 +184,9 @@ function Get-VictoryAtomic64Coverage {
     $status = $coverageMatches[0].Groups[1].Value
     $adapters = [uint64]$coverageMatches[0].Groups[2].Value
     $cases = [uint64]$coverageMatches[0].Groups[3].Value
-    if (($status -eq 'executed' -and ($adapters -eq 0 -or $cases -eq 0)) -or
+    if (($status -eq 'executed' -and ($adapters -eq 0 -or $cases -ne ($adapters * 352))) -or
         ($status -eq 'unsupported' -and ($adapters -ne 0 -or $cases -ne 0))) {
-        throw 'The atomic64 test reported contradictory execution/capability counts.'
+        throw 'The atomic64 test must execute all 352 cases per reported adapter, or report unsupported with zero executed cases.'
     }
     return [ordered]@{ status = $status; adapters = $adapters; cases = $cases }
 }
@@ -228,6 +228,61 @@ function Get-VictoryLdsCoverage {
         throw 'The LDS test must execute all 496 cases on each reported adapter.'
     }
     return [ordered]@{ status = 'executed'; adapters = $adapters; cases = $cases }
+}
+
+function Get-VictoryLdsDwordValidationCoverage {
+    param([Parameter(Mandatory)][string]$Output)
+    $coverageMatches = [regex]::Matches($Output, '(?m)^VICTORY_LDS_DWORD_VALIDATION_RESULT=validated containers=(\d+)\r?$')
+    if ($coverageMatches.Count -ne 1 -or [uint64]$coverageMatches[0].Groups[1].Value -ne 184) {
+        throw 'The dword LDS test must independently validate all 184 synthetic containers.'
+    }
+    return [ordered]@{ status = 'validated'; containers = 184 }
+}
+
+function Get-VictoryLdsDwordCoverage {
+    param([Parameter(Mandatory)][string]$Output)
+    $coverageMatches = [regex]::Matches($Output, '(?m)^VICTORY_LDS_DWORD_RESULT=executed adapters=(\d+) cases=(\d+)\r?$')
+    if ($coverageMatches.Count -ne 1) { throw 'The dword LDS test must report exactly one execution result.' }
+    $adapters = [uint64]$coverageMatches[0].Groups[1].Value
+    $cases = [uint64]$coverageMatches[0].Groups[2].Value
+    if ($adapters -eq 0 -or $cases -ne ($adapters * 552)) {
+        throw 'The dword LDS test must execute all 552 cases on each reported adapter.'
+    }
+    return [ordered]@{ status = 'executed'; adapters = $adapters; cases = $cases }
+}
+
+function Get-VictoryConstantCoverage {
+    param([Parameter(Mandatory)][string]$Output, [Parameter(Mandatory)][uint32]$ExpectedCases)
+    $coverageMatches = [regex]::Matches($Output, '(?m)^VICTORY_CONSTANT_RESULT=executed cases=(\d+) validation_errors=(\d+)\r?$')
+    if ($ExpectedCases -eq 0 -or $coverageMatches.Count -ne 1 -or
+        [uint64]$coverageMatches[0].Groups[1].Value -ne $ExpectedCases -or
+        [uint64]$coverageMatches[0].Groups[2].Value -ne 0) {
+        throw "Constant buffers must execute all $ExpectedCases expected cases with zero native validation errors."
+    }
+    return [ordered]@{ status = 'executed'; cases = $ExpectedCases; validation_errors = 0 }
+}
+
+function Get-VictoryRectangleCoverage {
+    param([Parameter(Mandatory)][string]$Output, [Parameter(Mandatory)][uint32]$ExpectedCases)
+    $results = [regex]::Matches($Output, '(?m)^VICTORY_RECTANGLE_RESULT=.*\r?$')
+    $coverageMatches = [regex]::Matches($Output, '(?m)^VICTORY_RECTANGLE_RESULT=executed cases=(\d+) validation_errors=(\d+)\r?$')
+    if ($ExpectedCases -eq 0 -or $results.Count -ne 1 -or $coverageMatches.Count -ne 1 -or
+        [uint64]$coverageMatches[0].Groups[1].Value -ne $ExpectedCases -or
+        [uint64]$coverageMatches[0].Groups[2].Value -ne 0) {
+        throw "Rectangle expansion must execute all $ExpectedCases expected cases with zero native validation errors."
+    }
+    return [ordered]@{ status = 'executed'; cases = $ExpectedCases; validation_errors = 0 }
+}
+
+function Get-VictoryMemoryCopyCoverage {
+    param([Parameter(Mandatory)][string]$Output)
+    $coverageMatches = [regex]::Matches($Output, '(?m)^VICTORY_MEMORY_COPY_RESULT=executed cases=(\d+)\r?$')
+    $validationMatches = [regex]::Matches($Output, '(?m)^VICTORY_MEMORY_COPY_VALIDATION=(checked|disabled) unexpected_errors=(\d+)\r?$')
+    if ($coverageMatches.Count -ne 1 -or [uint64]$coverageMatches[0].Groups[1].Value -ne 6 -or $validationMatches.Count -ne 1 -or
+        $validationMatches[0].Groups[1].Value -ne 'checked' -or [uint64]$validationMatches[0].Groups[2].Value -ne 0) {
+        throw 'Raw memory copies must execute all six scenarios with native debug validation and zero unexpected errors.'
+    }
+    return [ordered]@{ status = 'executed'; cases = 6; validation = 'checked'; unexpected_errors = 0 }
 }
 
 function Get-VictoryDepthBoundsCoverage {

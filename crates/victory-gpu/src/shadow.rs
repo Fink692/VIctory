@@ -17,9 +17,9 @@
 //! descriptors, buffer views in tables); buffers read through directly
 //! indexed heaps keep what their first use copied, and arbitrary heap
 //! indices do not declare their state needs. Distinct overlapping shadow
-//! allocations are not coherent aliases. CPU snapshot paths (unaligned
-//! CBVs and expanded geometry) still cannot read same-submission GPU
-//! outputs; GPU buffer/texture copies and known direct shader bindings can.
+//! allocations are not coherent aliases. GPU buffer/texture copies,
+//! rectangle input expansion, aligned constant staging and known direct
+//! shader bindings consume earlier same-submission GPU outputs.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -420,7 +420,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
-        let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(1 << 16))?;
+        let (buffer, data) = host()?.shared_buffer(len.checked_next_multiple_of(1 << 16)?)?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -454,7 +454,7 @@ static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::ne
 
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
-    let len = end.next_multiple_of(WINDOW) - start;
+    let len = end.checked_next_multiple_of(WINDOW)?.checked_sub(start)?;
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(shadow) = map.get(&(start, len)) {
         return Some(shadow.clone());

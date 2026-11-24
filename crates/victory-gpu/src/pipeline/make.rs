@@ -42,13 +42,28 @@ unsafe impl Send for Pending {}
 unsafe impl Sync for Pending {}
 
 impl Pending {
+    #[cfg(test)]
+    pub(crate) fn from_host_for_test(host: HostPipeline) -> Pending {
+        let pending = Self::new(Vec::new(), None);
+        assert!(pending.made.set(Some(host)).is_ok());
+        // Authored fixtures need no persistent title-pipeline cache entry.
+        pending.used.store(true, Ordering::Relaxed);
+        pending
+    }
+
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
         let mut key = blake3::Hasher::new();
         for s in &shaders {
             key.update(s.stage.as_bytes());
             key.update(s.hash.as_bytes());
         }
-        key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        key.update(
+            graphics
+                .as_ref()
+                .map(|g| g.describe())
+                .unwrap_or_default()
+                .as_bytes(),
+        );
         Pending {
             shaders,
             graphics,
@@ -122,7 +137,10 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 /// Queues `p` for the workers, once.
 fn start(p: &Arc<Pending>) {
     if !p.queued.swap(true, Ordering::Relaxed) {
-        PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+        PEAK.fetch_max(
+            WAITING.fetch_add(1, Ordering::Relaxed) + 1,
+            Ordering::Relaxed,
+        );
         queue(p.clone());
     }
 }
@@ -152,7 +170,10 @@ fn wait(p: &Pending, frame: u64) {
         if rest.is_zero() {
             break;
         }
-        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+        held = done
+            .wait_timeout(held, rest)
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
     }
     WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }

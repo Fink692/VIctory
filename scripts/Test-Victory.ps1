@@ -46,7 +46,7 @@ $summary = [ordered]@{
 }
 
 function Invoke-Check {
-    param([string]$Name, [string]$Executable, [string[]]$Arguments, [switch]$MustRunOneTest, [switch]$MustValidateAtomicMatrix, [switch]$OptionalAtomicSemantics, [switch]$MustValidateLdsMatrix, [switch]$MustExecuteLds, [switch]$OptionalDepthBounds, [switch]$MustMatchShaderHash, [hashtable]$EnvironmentOverrides = @{})
+    param([string]$Name, [string]$Executable, [string[]]$Arguments, [switch]$MustRunOneTest, [switch]$MustValidateAtomicMatrix, [switch]$OptionalAtomicSemantics, [switch]$MustValidateLdsMatrix, [switch]$MustExecuteLds, [switch]$OptionalDepthBounds, [switch]$MustMatchShaderHash, [switch]$MustValidateLdsDword, [switch]$MustExecuteLdsDword, [switch]$MustExecuteMemoryCopy, [uint32]$ConstantCases = 0, [uint32]$RectangleCases = 0, [hashtable]$EnvironmentOverrides = @{})
     Write-Host "Checking $Name..."
     $checkEnvironment = $environment.Clone()
     foreach ($key in $EnvironmentOverrides.Keys) { $checkEnvironment[$key] = $EnvironmentOverrides[$key] }
@@ -56,7 +56,7 @@ function Invoke-Check {
     $checks.Add($check)
     try {
         Assert-VictoryProcessSucceeded $result $Name
-        if ($MustRunOneTest -or $MustValidateAtomicMatrix -or $OptionalAtomicSemantics -or $MustValidateLdsMatrix -or $MustExecuteLds -or $OptionalDepthBounds -or $MustMatchShaderHash) {
+        if ($MustRunOneTest -or $MustValidateAtomicMatrix -or $OptionalAtomicSemantics -or $MustValidateLdsMatrix -or $MustExecuteLds -or $OptionalDepthBounds -or $MustMatchShaderHash -or $MustValidateLdsDword -or $MustExecuteLdsDword -or $MustExecuteMemoryCopy -or $ConstantCases -gt 0 -or $RectangleCases -gt 0) {
             $output = (Get-Content -LiteralPath $result.stdout_log -Raw) + (Get-Content -LiteralPath $result.stderr_log -Raw)
             if ($output -notmatch 'test result: ok\. 1 passed;' -or ($MustRunOneTest -and $output -match '; skipped')) {
                 throw "$Name did not run its required test successfully. See $($result.stdout_log)."
@@ -65,6 +65,11 @@ function Invoke-Check {
             if ($MustValidateLdsMatrix) { $check['coverage'] = Get-VictoryLdsValidationCoverage $output }
             if ($MustExecuteLds) { $check['coverage'] = Get-VictoryLdsCoverage $output }
             if ($MustMatchShaderHash) { $check['coverage'] = Get-VictoryShaderHashCoverage $output }
+            if ($MustValidateLdsDword) { $check['coverage'] = Get-VictoryLdsDwordValidationCoverage $output }
+            if ($MustExecuteLdsDword) { $check['coverage'] = Get-VictoryLdsDwordCoverage $output }
+            if ($MustExecuteMemoryCopy) { $check['coverage'] = Get-VictoryMemoryCopyCoverage $output }
+            if ($ConstantCases -gt 0) { $check['coverage'] = Get-VictoryConstantCoverage $output $ConstantCases }
+            if ($RectangleCases -gt 0) { $check['coverage'] = Get-VictoryRectangleCoverage $output $RectangleCases }
             if ($OptionalDepthBounds) {
                 $check['coverage'] = Get-VictoryDepthBoundsCoverage $output
                 Write-Host "$Name coverage: $($check.coverage.status); cases=$($check.coverage.cases)."
@@ -119,12 +124,18 @@ try {
         }
         Invoke-Check 'lds-dxil-validator' 'cargo' @('test', '--locked', '-p', 'victory-shader', '--all-features', 'emit::lds_tests::lds_subword_programs_translate_and_validate', '--', '--exact', '--nocapture') -MustRunOneTest -MustValidateLdsMatrix
         Invoke-Check 'lds-semantics' 'cargo' @('test', '--locked', '-p', 'victory-shader', '--all-features', 'emit::lds_tests::lds_subword_results_preserve_adjacent_bytes', '--', '--exact', '--nocapture') -MustRunOneTest -MustExecuteLds
+        Invoke-Check 'lds-dword-dxil-validator' 'cargo' @('test', '--locked', '-p', 'victory-shader', '--all-features', 'emit::lds_dword_tests::lds_dword_programs_translate_and_validate', '--', '--exact', '--nocapture') -MustRunOneTest -MustValidateLdsDword
+        Invoke-Check 'lds-dword-semantics' 'cargo' @('test', '--locked', '-p', 'victory-shader', '--all-features', 'emit::lds_dword_tests::lds_dword_bounds_and_inactive_lanes_preserve_memory', '--', '--exact', '--nocapture') -MustRunOneTest -MustExecuteLdsDword -EnvironmentOverrides @{ VICTORY_D3D12_DEBUG = '1'; VICTORY_LDS_TRACE = '1' }
         Invoke-Check 'warp-depth-bounds' 'cargo' @('test', '--locked', '-p', 'victory-gpu', '--all-features', 'pipeline::host::depth_bounds_tests::depth_bounds_filter_stored_depth_and_reset', '--', '--ignored', '--exact', '--nocapture') -OptionalDepthBounds -EnvironmentOverrides @{ VICTORY_D3D12_DEBUG = '1' }
         Invoke-Check 'warp-texture-copy-order' 'cargo' @('test', '--locked', '-p', 'victory-gpu', '--all-features', 'resource::copy_tests::gpu_texture_copies_preserve_order_and_guards', '--', '--ignored', '--exact', '--nocapture') -MustRunOneTest -EnvironmentOverrides @{ VICTORY_D3D12_DEBUG = '1' }
         Invoke-Check 'warp-texture-copy-lists' 'cargo' @('test', '--locked', '-p', 'victory-gpu', '--all-features', 'resource::copy_tests::texture_readback_crosses_lists_and_reuses_subresources', '--', '--ignored', '--exact', '--nocapture') -MustRunOneTest -EnvironmentOverrides @{ VICTORY_D3D12_DEBUG = '1' }
         Invoke-Check 'warp-texture-copy-ranges' 'cargo' @('test', '--locked', '-p', 'victory-gpu', '--all-features', 'resource::copy_tests::invalid_texture_copy_ranges_leave_destination_unchanged', '--', '--ignored', '--exact', '--nocapture') -MustRunOneTest -EnvironmentOverrides @{ VICTORY_D3D12_DEBUG = '1' }
         Invoke-Check 'warp-texture-copy-bc' 'cargo' @('test', '--locked', '-p', 'victory-gpu', '--all-features', 'resource::copy_tests::block_compressed_small_mips_round_trip', '--', '--ignored', '--exact', '--nocapture') -MustRunOneTest -EnvironmentOverrides @{ VICTORY_D3D12_DEBUG = '1' }
         Invoke-Check 'warp-texture-copy-planes' 'cargo' @('test', '--locked', '-p', 'victory-gpu', '--all-features', 'resource::copy_tests::depth_stencil_copies_use_selected_plane_formats', '--', '--ignored', '--exact', '--nocapture') -MustRunOneTest -EnvironmentOverrides @{ VICTORY_D3D12_DEBUG = '1' }
+        Invoke-Check 'warp-memory-copy' 'cargo' @('test', '--locked', '-p', 'victory-gpu', '--all-features', 'list::memory_copy_tests::raw_memory_copies_observe_gpu_writes_and_preserve_guards', '--', '--ignored', '--exact', '--nocapture') -MustRunOneTest -MustExecuteMemoryCopy -EnvironmentOverrides @{ VICTORY_D3D12_DEBUG = '1' }
+        Invoke-Check 'warp-constant-data' 'cargo' @('test', '--locked', '-p', 'victory-gpu', '--all-features', 'draw::constant_tests::constant_buffers_follow_gpu_writes_and_table_reuse', '--', '--ignored', '--exact', '--nocapture') -MustRunOneTest -ConstantCases 24 -EnvironmentOverrides @{ VICTORY_D3D12_DEBUG = '1' }
+        Invoke-Check 'warp-constant-lists' 'cargo' @('test', '--locked', '-p', 'victory-gpu', '--all-features', 'draw::constant_tests::constant_buffers_follow_submission_order_and_reexecute', '--', '--ignored', '--exact', '--nocapture') -MustRunOneTest -ConstantCases 10 -EnvironmentOverrides @{ VICTORY_D3D12_DEBUG = '1' }
+        Invoke-Check 'warp-rectangle-data' 'cargo' @('test', '--locked', '-p', 'victory-gpu', '--all-features', 'primitive::gpu::tests::gpu_rectangles_observe_copies_formats_and_rebind_draw_state', '--', '--ignored', '--exact', '--nocapture') -MustRunOneTest -RectangleCases 24 -EnvironmentOverrides @{ VICTORY_D3D12_DEBUG = '1' }
         Invoke-Check 'warp-query-results' 'cargo' @('test', '--locked', '-p', 'victory-gpu', '--all-features', 'query::tests::timestamp_queries_execute_and_preserve_destination_guards', '--', '--ignored', '--exact', '--nocapture') -MustRunOneTest
         Invoke-Check 'warp-empty-queries' 'cargo' @('test', '--locked', '-p', 'victory-gpu', '--all-features', 'query::tests::empty_occlusion_and_pipeline_queries_return_measured_zeroes', '--', '--ignored', '--exact', '--nocapture') -MustRunOneTest
         Invoke-Check 'warp-query-copies' 'cargo' @('test', '--locked', '-p', 'victory-gpu', '--all-features', 'query::tests::resolved_queries_feed_gpu_copies_across_lists', '--', '--ignored', '--exact', '--nocapture') -MustRunOneTest
