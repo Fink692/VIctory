@@ -48,25 +48,6 @@ function Assert-FileHash {
     if ($actual -ne $Expected.ToLowerInvariant()) { throw "Unexpected SHA256 for $Path" }
 }
 
-function Get-WarpModuleEvidence {
-    param([string]$Output, [string]$ExpectedPath, [string]$ExpectedVersion)
-    $blocks = [regex]::Matches($Output, '(?ms)^VICTORY_WARP_MODULE_BEGIN\r?\n(.*?)^VICTORY_WARP_MODULE_END\r?$')
-    if ($blocks.Count -eq 0) { throw 'The debugger did not capture the loaded WARP module.' }
-    $observed = [Collections.Generic.List[object]]::new()
-    foreach ($block in $blocks) {
-        $pathMatch = [regex]::Match($block.Groups[1].Value, '(?im)^\s*Image path:\s*(.+?d3d10warp\.dll)\s*$')
-        $versionMatch = [regex]::Match($block.Groups[1].Value, '(?im)^\s*File version:\s*([\d.]+)\s*$')
-        if (-not $pathMatch.Success -or -not $versionMatch.Success) { throw 'WARP module path/version evidence is incomplete.' }
-        $path = $pathMatch.Groups[1].Value.Trim()
-        $version = $versionMatch.Groups[1].Value
-        if (-not [string]::Equals($path, $ExpectedPath, [StringComparison]::OrdinalIgnoreCase) -or $version -ne $ExpectedVersion) {
-            throw "Unexpected loaded WARP: $path version $version; expected $ExpectedPath version $ExpectedVersion"
-        }
-        $observed.Add([ordered]@{ path = $path; file_version = $version })
-    }
-    return $observed[0]
-}
-
 try {
     if (-not $CdbPath) {
         $command = Get-Command cdb.exe -ErrorAction SilentlyContinue
@@ -171,7 +152,7 @@ g
                     if (Test-Path -LiteralPath $nativeLog) { $output += Get-Content -LiteralPath $nativeLog -Raw }
                     $expectedPath = if ($runtime -eq 'pinned') { $pinnedDll } else { $inboxDll }
                     $expectedVersion = if ($runtime -eq 'pinned') { $pinnedVersion } else { $inboxVersion }
-                    $run['loaded_warp'] = Get-WarpModuleEvidence $output $expectedPath $expectedVersion
+                    $run['loaded_warp'] = Get-VictoryWarpModuleEvidence -Output $output -ExpectedPath $expectedPath -ExpectedVersion $expectedVersion
                     Assert-VictoryProcessSucceeded $result $label
                     $run['coverage'] = Get-VictoryNativeShaderCoverage $output
                     $expectedTests = if ($kind -eq 'gpu' -or $sourceRun.label -eq 'isolated-lds') { 1 } elseif ($sourceRun.label -eq 'isolated-valu') { 7 } else { 0 }

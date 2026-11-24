@@ -52,9 +52,9 @@ impl Validation {
             messages: Box::default(),
             cookie: 0,
         };
-        if cfg!(feature = "diagnostics")
-            && std::env::var("VICTORY_D3D12_DEBUG").is_ok_and(|v| v == "1")
-        {
+        // Match Host's presence-based switch, including nonempty values
+        // other than "1", so an active debug layer is always observed.
+        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DEBUG").is_some() {
             let queue = device
                 .cast::<ID3D12InfoQueue1>()
                 .expect("the requested debug layer must support message capture");

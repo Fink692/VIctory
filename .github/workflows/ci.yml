@@ -11,6 +11,11 @@ on:
         required: true
         default: HEAD^
         type: string
+      compare_inbox_warp:
+        description: Also reproduce the known inbox-WARP failures against the pinned runtime
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -64,7 +69,7 @@ jobs:
           FORMAT_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before || inputs.format_base_ref }}
         run: ./scripts/Test-Victory.ps1 -RequireGpu -NativeShaderDebug -FormatBaseRef "$env:FORMAT_BASE_REF" -OutputRoot "$env:RUNNER_TEMP/victory-checks"
       - name: Compare inbox and pinned Microsoft WARP
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && inputs.compare_inbox_warp }}
         run: |
           $shader = @(Get-ChildItem -LiteralPath "$env:RUNNER_TEMP/victory-checks" -Filter native-shader.json -Recurse)
           $gpu = @(Get-ChildItem -LiteralPath "$env:RUNNER_TEMP/victory-checks" -Filter native-gpu.json -Recurse)
@@ -84,5 +89,6 @@ jobs:
             ${{ runner.temp }}/victory-checks/**/native-shader.json
             ${{ runner.temp }}/victory-checks/**/native-gpu.json
             ${{ runner.temp }}/victory-checks/**/warp-comparison.json
+            ${{ runner.temp }}/victory-checks/**/warp-runtime.json
           if-no-files-found: ignore
           retention-days: 7

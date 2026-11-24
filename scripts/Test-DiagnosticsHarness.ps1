@@ -99,7 +99,25 @@ exit $ExitCode
     Assert-Rejected { Get-VictoryNativeShaderCoverage ($nativeOk + "test result: FAILED. 1 passed; 1 failed; 0 ignored;`n") } 'A failed Rust suite must fail the debugger gate.'
     Assert-Rejected { Get-VictoryNativeShaderCoverage ($nativeOk + "test result: ok. 78 passed; 0 failed; 0 ignored;`n") } 'Conflicting native terminal results must fail.'
     Assert-Rejected { Get-VictoryNativeShaderCoverage "VICTORY_NATIVE_DEBUGGER_READY`ntest result: ok. 0 passed; 0 failed; 0 ignored;`n" } 'A debugger run must discover actual tests.'
-    Write-Host 'Diagnostics harness checks passed: external paths, argument quoting, environment isolation, dual-stream capture, nonzero exit, timeout, no overwrite, explicit semantic coverage and native debugger failure propagation.'
+    $warpPath = 'C:\victory runtime\d3d10warp.dll'
+    $warpVersion = '1.0.22.0'
+    $warpModule = "VICTORY_WARP_MODULE_BEGIN`r`n    Image path: $warpPath`r`n    File version: $warpVersion`r`nVICTORY_WARP_MODULE_END`r`n"
+    $evidence = Get-VictoryWarpModuleEvidence -Output ($warpModule + $warpModule) -ExpectedPath $warpPath.ToUpperInvariant() -ExpectedVersion $warpVersion
+    Assert-That ($evidence.path -ceq $warpPath -and $evidence.file_version -eq $warpVersion) 'Loaded WARP evidence must tolerate duplicate output and case-insensitive Windows paths.'
+    $evidence = Get-VictoryWarpModuleEvidence -Output ($warpModule + "VICTORY_NATIVE_UNHANDLED`n")
+    Assert-That ($evidence.path -ceq $warpPath -and $evidence.file_version -eq $warpVersion) 'A failed native process must retain its observed runtime identity independently of test success.'
+    Assert-Rejected { Get-VictoryWarpModuleEvidence -Output $nativeOk -ExpectedPath $warpPath -ExpectedVersion $warpVersion } 'Passing tests cannot substitute for loaded WARP module evidence.'
+    Assert-Rejected { Get-VictoryWarpModuleEvidence -Output '' -ExpectedPath $warpPath -ExpectedVersion $warpVersion } 'Missing runtime output must not establish a WARP identity.'
+    Assert-Rejected { Get-VictoryWarpModuleEvidence -Output $warpModule.Replace("    Image path: $warpPath`r`n", '') -ExpectedPath $warpPath -ExpectedVersion $warpVersion } 'Module evidence must include the loaded DLL path.'
+    Assert-Rejected { Get-VictoryWarpModuleEvidence -Output $warpModule.Replace("    File version: $warpVersion`r`n", '') -ExpectedPath $warpPath -ExpectedVersion $warpVersion } 'Module evidence must include the loaded file version.'
+    $otherPath = $warpModule.Replace($warpPath, 'C:\Windows\System32\d3d10warp.dll')
+    $otherVersion = $warpModule.Replace($warpVersion, '10.0.26100.33648')
+    Assert-Rejected { Get-VictoryWarpModuleEvidence -Output $otherPath -ExpectedPath $warpPath -ExpectedVersion $warpVersion } 'The wrong loaded WARP path must fail even with the expected version.'
+    Assert-Rejected { Get-VictoryWarpModuleEvidence -Output $otherVersion -ExpectedPath $warpPath -ExpectedVersion $warpVersion } 'The wrong loaded WARP version must fail even with the expected path.'
+    Assert-Rejected { Get-VictoryWarpModuleEvidence -Output ($warpModule + $otherPath) } 'Conflicting loaded module paths must fail even without a pinned expectation.'
+    Assert-Rejected { Get-VictoryWarpModuleEvidence -Output ($warpModule + $otherVersion) } 'Conflicting loaded module versions must fail even without a pinned expectation.'
+    Assert-Rejected { Get-VictoryWarpModuleEvidence -Output $warpModule -ExpectedPath $warpPath } 'A runtime requirement must specify both path and version.'
+    Write-Host 'Diagnostics harness checks passed: external paths, argument quoting, environment isolation, dual-stream capture, nonzero exit, timeout, no overwrite, explicit semantic coverage, native debugger failure propagation and loaded WARP identity.'
 } finally {
     [Environment]::SetEnvironmentVariable('VICTORY_DIAG_TEST_INHERITED', $oldInherited)
     if (Test-Path -LiteralPath (Join-Path $temp 'linked-copy')) { Remove-Item -LiteralPath (Join-Path $temp 'linked-copy') -Force }

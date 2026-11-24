@@ -10,7 +10,9 @@ text. Any failed control fails the overall check; no process dumps are written.
 [CmdletBinding()]
 param(
     [string]$OutputRoot = (Join-Path ([IO.Path]::GetTempPath()) 'victory-native-gpu'),
-    [string]$CdbPath
+    [string]$CdbPath,
+    [string]$ExpectedWarpDll,
+    [string]$ExpectedWarpVersion
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -42,6 +44,13 @@ $summary = [ordered]@{
 }
 
 try {
+    if ([bool]$ExpectedWarpDll -ne [bool]$ExpectedWarpVersion) {
+        throw 'Provide both -ExpectedWarpDll and -ExpectedWarpVersion.'
+    }
+    if ($ExpectedWarpDll) {
+        $ExpectedWarpDll = [IO.Path]::GetFullPath($ExpectedWarpDll)
+        $summary['expected_warp'] = [ordered]@{ path = $ExpectedWarpDll; file_version = $ExpectedWarpVersion }
+    }
     if (-not $CdbPath) {
         $command = Get-Command cdb.exe -ErrorAction SilentlyContinue
         if ($command) { $CdbPath = $command.Source }
@@ -76,6 +85,7 @@ try {
 sxd -c2 "$exceptionCommands" av
 sxd -c2 "$exceptionCommands" 0xc0000409
 sxn out
+sxe -c ".echo VICTORY_WARP_MODULE_BEGIN; lmvm d3d10warp; .echo VICTORY_WARP_MODULE_END; g" ld:*d3d10warp*
 .echo VICTORY_NATIVE_DEBUGGER_READY
 g
 "@ | Set-Content -LiteralPath $commands -Encoding ascii
@@ -97,9 +107,12 @@ g
         try {
             $result = Invoke-VictoryProcess -Executable $CdbPath -Arguments $arguments -WorkingDirectory $script:VictoryRepoRoot -LogPrefix $prefix -Environment $runEnvironment -TimeoutSeconds 300
             $run['process'] = $result
-            Assert-VictoryProcessSucceeded $result "native-gpu-$label"
             $output = (Get-Content -LiteralPath $result.stdout_log -Raw) + (Get-Content -LiteralPath $result.stderr_log -Raw)
             if (Test-Path -LiteralPath $nativeLog) { $output += Get-Content -LiteralPath $nativeLog -Raw }
+            if ($output) {
+                $run['loaded_warp'] = Get-VictoryWarpModuleEvidence -Output $output -ExpectedPath $ExpectedWarpDll -ExpectedVersion $ExpectedWarpVersion
+            }
+            Assert-VictoryProcessSucceeded $result "native-gpu-$label"
             $run['coverage'] = Get-VictoryNativeShaderCoverage $output
             if ($run.coverage.passed -ne 1 -or $run.coverage.ignored -ne 0) {
                 throw "$label must complete exactly one test with none ignored."

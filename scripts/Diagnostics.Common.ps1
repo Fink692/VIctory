@@ -143,6 +143,38 @@ function Assert-VictoryProcessSucceeded {
     }
 }
 
+function Get-VictoryWarpModuleEvidence {
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Output,
+        [string]$ExpectedPath,
+        [string]$ExpectedVersion
+    )
+    if ([bool]$ExpectedPath -ne [bool]$ExpectedVersion) {
+        throw 'Provide both the expected WARP DLL path and file version.'
+    }
+    $blocks = [regex]::Matches($Output, '(?ms)^VICTORY_WARP_MODULE_BEGIN\r?\n(.*?)^VICTORY_WARP_MODULE_END\r?$')
+    if ($blocks.Count -eq 0) { throw 'The debugger did not capture the loaded WARP module.' }
+    $observed = [Collections.Generic.List[object]]::new()
+    foreach ($block in $blocks) {
+        $pathMatch = [regex]::Match($block.Groups[1].Value, '(?im)^\s*Image path:\s*(.+?d3d10warp\.dll)\s*$')
+        $versionMatch = [regex]::Match($block.Groups[1].Value, '(?im)^\s*File version:\s*([\d.]+)\s*$')
+        if (-not $pathMatch.Success -or -not $versionMatch.Success) { throw 'WARP module path/version evidence is incomplete.' }
+        $path = $pathMatch.Groups[1].Value.Trim()
+        $version = $versionMatch.Groups[1].Value
+        # Without an expected runtime, still require every captured load to
+        # agree. CDB may repeat the same module block in stdout and its log.
+        if (-not $ExpectedPath) {
+            $ExpectedPath = $path
+            $ExpectedVersion = $version
+        }
+        if (-not [string]::Equals($path, $ExpectedPath, [StringComparison]::OrdinalIgnoreCase) -or $version -ne $ExpectedVersion) {
+            throw "Unexpected loaded WARP: $path version $version; expected $ExpectedPath version $ExpectedVersion"
+        }
+        $observed.Add([ordered]@{ path = $path; file_version = $version })
+    }
+    return $observed[0]
+}
+
 function Get-VictoryAtomic64Coverage {
     param([Parameter(Mandatory)][string]$Output)
     # The semantic test emits this only after all supported cases complete,

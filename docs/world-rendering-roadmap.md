@@ -15,9 +15,9 @@ evidence; it does not claim that the title is playable.
 | Shader identity | Replace the all-zero `HASH` part with standard MD5 of each program's bitcode, independently of the DXBC container signature; invalidate old generated shader cache entries. | Padding/reference vectors, deterministic/different-program regressions and two authored programs compiled with official DXC verify the payload. The hosted Windows reference comparison passed, but the concurrent native crash persisted after this correction. |
 | Capability checks and shader cache | Check actual host int64, typed-atomic, descriptor-heap-atomic and fixed-wave capabilities, including requirements read from cached shader containers. Refuse unsupported wave sizes before pipeline creation and invalidate old generated shader cache entries. | Windows code cross-compiles. Boundary tests cover wave-size support and failed feature queries. Confirm actual adapter features and behavior from a Windows run. |
 | GPU queries and ordering | Allocate host query heaps, record begin/end/resolve operations, preserve query lifetime through submission, track host buffer states and perform buffer copies on the GPU. Use the host queue's clock/frequency. | Required hosted Windows/WARP tests passed for timestamp destinations, measured empty occlusion/statistics queries and resolve-to-copy ordering. Physical GPU/title execution remains required. |
-| Texture copies and readback | Copy buffer footprints through GPU staging so earlier GPU writes are visible; implement texture-to-buffer readback, partial destinations and same-texture mip copies. Validate ranges and repack title row pitches/offsets into native layouts. | Portable footprint bounds tests and Windows cross-compilation pass. Required Windows fixtures check GPU-produced input, guard bytes, partial pixels and producer/consumer lists recorded in reverse order. Native execution and title verification remain outstanding until the tested commit's Windows gate completes. |
-| Byte/halfword shared memory | Lower 14 LDS subword instructions, including signed reads and d16 half-register preservation; use atomic word updates/reads so neighboring byte writers do not race. | All 168 synthetic containers passed independent DXV validation. The mandatory Windows test compares 496 dispatch cases per adapter, including cross-wave neighboring fields. Native execution and title verification remain separate gates. |
-| Depth bounds | Preserve the enable bit in graphics/mesh pipeline streams, check host support, route dynamic title state and reset native bounds. | Portable normalization tests and Windows cross-compilation pass. The optional-feature Windows test records all 14 measured cases or explicitly reports unsupported with zero executed cases; title verification remains required. |
+| Texture copies and readback | Copy buffer footprints through GPU staging so earlier GPU writes are visible; implement texture-to-buffer readback, partial destinations and same-texture mip copies. Validate ranges and repack title row pitches/offsets into native layouts; expand validated BC edges to full physical blocks. | All five authored Windows copy tests passed, including GPU-produced input, guard bytes, partial pixels, reverse-recorded producer/consumer lists, compressed small mips and selected depth/stencil planes. The BC regression also passed on both compared WARP versions. Title verification remains required. |
+| Byte/halfword shared memory | Lower 14 LDS subword instructions, including signed reads and d16 half-register preservation; use atomic word updates/reads so neighboring byte writers do not race. | All 168 synthetic containers passed independent DXV validation. The mandatory Windows test executed all 496 dispatch cases per adapter, including cross-wave neighboring fields, on both compared WARP versions. Physical GPU/title verification remains required. |
+| Depth bounds | Preserve the enable bit in graphics/mesh pipeline streams, check host support, route dynamic title state and reset native bounds. | All 14 measured cases passed on WARP 1.0.22 with valid descriptor bindings and no unexpected debug-layer errors. Inbox WARP 10.0.26100.33648 advertised support but failed the depth-disabled combination. Unsupported capabilities remain explicit; physical GPU/title verification is separate. |
 | Indirect execution | Saturate the work budget, honor actual count-buffer values, validate argument/count ranges and transition the count buffer for indirect reads. | CPU boundary tests and the required hosted WARP regression passed for overflow, inactive records and binding conflicts. Physical GPU/title execution remains required. |
 | Shader census | Add deterministic JSON failure groups and per-program runtime-compatible hashes; distinguish emitted, validated and pipeline-created results. Surface scan and check-initialization errors. | CLI tests cover failure gates, unavailable checks, hashes, report serialization and refusing output replacement. Full title inputs are not available in this workspace. |
 | Reproducible diagnostics | Add isolated saves/caches, deadlines, separate process logs, loop-limit/pipeline/console experiments and explicit observation records. | Synthetic process tests passed on Linux and hosted Windows for quoting, environment isolation, output capture, failures, deadlines and output paths. They do not execute the title. |
@@ -41,14 +41,25 @@ debug messages when available. A passing subset is not a passing workflow;
 use the current result linked from the pull request, including any subsequent
 fixes and capability-based coverage gaps.
 
-The PR's Windows gate subsequently passed, but the merged `main` run exposed
-another access violation in the concurrent shader suite. The annotation fix
-therefore did not establish that the native crash was resolved. The current
-gate repeats the concurrent synthetic shader suite under CDB and collects
-second-chance exception context and all-thread stacks. It does not serialize
-the suite or count a zero debugger exit as success without a complete passing
-Rust result. Until the failure is diagnosed and the current Windows job
-passes, this remains an open regression.
+The first PR's Windows gate subsequently passed, but the merged `main` run
+exposed another access violation in the concurrent shader suite. Neither
+the annotation correction nor the later shader HASH correction eliminated
+that failure on inbox WARP. A controlled comparison then ran identical
+executables and arguments against inbox `10.0.26100.33648` and official WARP
+`1.0.22.0`. The inbox runtime failed all three concurrent attempts and the
+isolated VALU control; the pinned runtime passed all three attempts (83
+tests each), all seven VALU tests, 496 LDS cases and all 14 depth cases.
+The loaded paths/versions and executable hashes were checked, and the full
+shader/VALU runs used the same SDK validator. See
+[the comparison run](https://github.com/Fink692/VIctory/actions/runs/45429956002).
+
+The complete Windows gate now prepares that pinned software runtime and
+requires its actual loaded identity in the native controls. The concurrent
+suite still runs three times with four test threads; a zero debugger exit
+cannot substitute for a complete passing Rust result. The optional manual
+inbox comparison preserves failures. Acceptance still requires the complete
+current Windows job, including workspace tests and builds, to pass; the
+comparison alone did not run the entire workspace on the newer runtime.
 
 The buffer-state work covers known vertex/index, descriptor/root-buffer,
 indirect, query and buffer/texture-copy paths. It does not establish arbitrary

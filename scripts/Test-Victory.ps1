@@ -10,6 +10,7 @@ failing instead of counting a missing validator/adapter as a passing test.
 param(
     [string]$OutputRoot = (Join-Path ([IO.Path]::GetTempPath()) 'victory-checks'),
     [string]$FormatBaseRef = 'origin/main',
+    [string]$WarpPackagePath,
     [switch]$RequireGpu,
     [switch]$NativeShaderDebug
 )
@@ -18,6 +19,7 @@ Set-StrictMode -Version Latest
 if (-not $IsWindows) { throw 'Test-Victory.ps1 requires Windows x64 and the MSVC build tools.' }
 if ($NativeShaderDebug -and -not $RequireGpu) { throw '-NativeShaderDebug requires -RequireGpu.' }
 . (Join-Path $PSScriptRoot 'Diagnostics.Common.ps1')
+. (Join-Path $PSScriptRoot 'Initialize-VictoryWarp.ps1')
 $report = New-VictoryReportDirectory $OutputRoot 'checks'
 $config = Join-Path $report 'victory.toml'
 '[paths]' | Set-Content -LiteralPath $config -Encoding utf8
@@ -85,6 +87,10 @@ function Invoke-Check {
 try {
     Invoke-Check 'toolchain' 'rustc' @('--version', '--verbose')
     Invoke-Check 'format' (Get-Process -Id $PID).Path @('-NoProfile', '-NonInteractive', '-File', (Join-Path $PSScriptRoot 'Test-ChangedRustFormat.ps1'), '-BaseRef', $FormatBaseRef)
+    $warp = Initialize-VictoryWarp -CacheDirectory (Join-Path $report 'warp-package') -ApplicationDirectory @((Join-Path $script:VictoryRepoRoot 'target/debug/deps')) -PackagePath $WarpPackagePath -ReportPath (Join-Path $report 'warp-runtime.json')
+    $summary['warp_runtime'] = $warp
+    $warpDll = $warp.installations[0].dll_path
+    Write-Host "Prepared Microsoft WARP $($warp.dll_version) for synthetic tests."
     if ($RequireGpu) {
         $kits = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits/10/bin'
         $validator = Get-ChildItem -LiteralPath $kits -Directory |
@@ -108,8 +114,8 @@ try {
         Invoke-Check 'atomic64-unguarded-semantics' 'cargo' @('test', '--locked', '-p', 'victory-shader', '--all-features', 'emit::atomic_tests::image_atomic64_results_match_integer_semantics', '--', '--exact', '--nocapture') -OptionalAtomicSemantics -EnvironmentOverrides @{ VICTORY_D3D12_DEBUG = '1' }
         Invoke-Check 'atomic64-guarded-semantics' 'cargo' @('test', '--locked', '-p', 'victory-shader', '--all-features', 'emit::atomic_tests::guarded_image_atomic64_results_match_integer_semantics', '--', '--exact', '--nocapture') -OptionalAtomicSemantics -EnvironmentOverrides @{ VICTORY_D3D12_DEBUG = '1' }
         if ($NativeShaderDebug) {
-            Invoke-Check 'native-shader-debug' (Get-Process -Id $PID).Path @('-NoProfile', '-NonInteractive', '-File', (Join-Path $PSScriptRoot 'Test-NativeShader.ps1'), '-OutputRoot', $report)
-            Invoke-Check 'native-gpu-debug' (Get-Process -Id $PID).Path @('-NoProfile', '-NonInteractive', '-File', (Join-Path $PSScriptRoot 'Test-NativeGpu.ps1'), '-OutputRoot', $report)
+            Invoke-Check 'native-shader-debug' (Get-Process -Id $PID).Path @('-NoProfile', '-NonInteractive', '-File', (Join-Path $PSScriptRoot 'Test-NativeShader.ps1'), '-OutputRoot', $report, '-ExpectedWarpDll', $warpDll, '-ExpectedWarpVersion', $warp.dll_version)
+            Invoke-Check 'native-gpu-debug' (Get-Process -Id $PID).Path @('-NoProfile', '-NonInteractive', '-File', (Join-Path $PSScriptRoot 'Test-NativeGpu.ps1'), '-OutputRoot', $report, '-ExpectedWarpDll', $warpDll, '-ExpectedWarpVersion', $warp.dll_version)
         }
         Invoke-Check 'lds-dxil-validator' 'cargo' @('test', '--locked', '-p', 'victory-shader', '--all-features', 'emit::lds_tests::lds_subword_programs_translate_and_validate', '--', '--exact', '--nocapture') -MustRunOneTest -MustValidateLdsMatrix
         Invoke-Check 'lds-semantics' 'cargo' @('test', '--locked', '-p', 'victory-shader', '--all-features', 'emit::lds_tests::lds_subword_results_preserve_adjacent_bytes', '--', '--exact', '--nocapture') -MustRunOneTest -MustExecuteLds

@@ -12,7 +12,9 @@ param(
     [string]$OutputRoot = (Join-Path ([IO.Path]::GetTempPath()) 'victory-native-shader'),
     [string]$CdbPath,
     [ValidateRange(1, 5)][int]$Attempts = 3,
-    [ValidateRange(2, 32)][int]$TestThreads = 4
+    [ValidateRange(2, 32)][int]$TestThreads = 4,
+    [string]$ExpectedWarpDll,
+    [string]$ExpectedWarpVersion
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -46,6 +48,13 @@ $summary = [ordered]@{
 }
 
 try {
+    if ([bool]$ExpectedWarpDll -ne [bool]$ExpectedWarpVersion) {
+        throw 'Provide both -ExpectedWarpDll and -ExpectedWarpVersion.'
+    }
+    if ($ExpectedWarpDll) {
+        $ExpectedWarpDll = [IO.Path]::GetFullPath($ExpectedWarpDll)
+        $summary['expected_warp'] = [ordered]@{ path = $ExpectedWarpDll; file_version = $ExpectedWarpVersion }
+    }
     if (-not $CdbPath) {
         $command = Get-Command cdb.exe -ErrorAction SilentlyContinue
         if ($command) { $CdbPath = $command.Source }
@@ -79,6 +88,7 @@ try {
     # A live exception already selects its faulting context; .ecxr is for dumps.
     @'
 sxd -c2 ".echo VICTORY_NATIVE_UNHANDLED; .lastevent; .exr -1; r; kn 64; ~* kn 32; lm; lmvm d3d10warp; lmvm D3D12Core; q" av
+sxe -c ".echo VICTORY_WARP_MODULE_BEGIN; lmvm d3d10warp; .echo VICTORY_WARP_MODULE_END; g" ld:*d3d10warp*
 .echo VICTORY_NATIVE_DEBUGGER_READY
 g
 '@ | Set-Content -LiteralPath $commands -Encoding ascii
@@ -101,9 +111,12 @@ g
         try {
             $result = Invoke-VictoryProcess -Executable $CdbPath -Arguments $arguments -WorkingDirectory $script:VictoryRepoRoot -LogPrefix $prefix -Environment $runEnvironment -TimeoutSeconds 300
             $run['process'] = $result
-            Assert-VictoryProcessSucceeded $result "native-shader-$Label"
             $output = (Get-Content -LiteralPath $result.stdout_log -Raw) + (Get-Content -LiteralPath $result.stderr_log -Raw)
             if (Test-Path -LiteralPath $nativeLog) { $output += Get-Content -LiteralPath $nativeLog -Raw }
+            if ($output) {
+                $run['loaded_warp'] = Get-VictoryWarpModuleEvidence -Output $output -ExpectedPath $ExpectedWarpDll -ExpectedVersion $ExpectedWarpVersion
+            }
+            Assert-VictoryProcessSucceeded $result "native-shader-$Label"
             $run['coverage'] = Get-VictoryNativeShaderCoverage $output
             if ($ExpectedTests -and ($run.coverage.passed -ne $ExpectedTests -or $run.coverage.ignored -ne 0)) {
                 throw "$Label must complete exactly $ExpectedTests tests with none ignored."

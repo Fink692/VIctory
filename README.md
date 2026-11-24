@@ -40,8 +40,8 @@ What each part does today and what it still needs:
 | Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
 | GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
 | GPU: world | Mesh pipelines, shader-written buffers, descriptor lifetimes, bounded indirect execution, worker-created pipelines cached on disk; native queries and depth-bounds state implemented | Most of the scene is still missing; hardware verification of query/indirect/depth paths, HDR and scaling remain |
-| Shaders | Console GPU code recompiled to DXIL at first use, cached on disk; 32/64-bit integer image atomics and byte/halfword shared-memory operations covered by synthetic translation and DXIL validation | Resolve the intermittent native Windows test crash; physical-GPU/title execution, merged geometry stages and ray-tracing builder shaders; some compute programs need a GPU with 64-lane waves |
-| Textures | Console tiled layouts and detiling for the modes the title uses; GPU-ordered buffer/texture copies and linear readback implemented | Native and title validation of the new copies; render-target metadata planes |
+| Shaders | Console GPU code recompiled to DXIL at first use, cached on disk; 32/64-bit integer image atomics and byte/halfword shared-memory operations covered by synthetic validation and WARP execution | Physical-GPU/title execution, merged geometry stages and ray-tracing builder shaders; some compute programs need a GPU with 64-lane waves |
+| Textures | Console tiled layouts and detiling for the modes the title uses; GPU-ordered buffer/texture copies and linear readback pass authored Windows tests | Title validation of copy behavior; render-target metadata planes |
 | Series S mode | Runs through the menus to the loading screen | The world, as above |
 
 The title results above describe the last reported hardware run, before the
@@ -51,6 +51,13 @@ Those counts have not been remeasured with this branch and do not establish
 which shaders execute in the world. See the
 [implementation status and remaining gates](docs/world-rendering-roadmap.md)
 and the [reproducible diagnostics workflow](docs/diagnostics.md).
+
+Software validation uses the pinned Microsoft WARP 1.0.22 runtime. A
+controlled comparison found native compiler crashes and incorrect depth
+bounds in the runner's inbox WARP 10.0.26100.33648; the same tests passed
+with the pinned version. The validation and diagnostics scripts prepare
+and verify it automatically. This is synthetic software-renderer evidence,
+not a new title or physical-GPU result.
 
 ## Getting started
 
@@ -66,7 +73,7 @@ the Windows paging file size, then retry.
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit
 copy victory.example.toml victory.toml   # then set your paths (outside the repo)
-cargo test --workspace                   # needs no game data
+pwsh -NoProfile -File scripts/Test-Victory.ps1 -RequireGpu  # needs no game data
 cargo run -p victory -- config           # check your paths
 ```
 

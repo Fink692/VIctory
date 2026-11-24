@@ -13,6 +13,32 @@ test gate also needs the SDK's `x64/dxil.dll`, sibling `dxc.exe`, and a WARP ada
 create the synthetic shader-model 6.6 pipeline. A missing prerequisite is a
 failure of this gate, rather than a passing skipped GPU test.
 
+The supported software-validation runtime is Microsoft.Direct3D.WARP
+**1.0.22** (DLL version **1.0.22.0**). `Test-Victory.ps1` automatically
+downloads the pinned official NuGet package, verifies its hashes and DLL
+version, and places the runtime beside the Cargo test executables in
+`target/debug/deps`. It records the installed files in `warp-runtime.json`.
+CI's native controls also require the actual loaded DLL path/version to
+match that installation. This does not change Windows' installed renderer.
+
+The controlled [runtime comparison](https://github.com/Fink692/VIctory/actions/runs/45429956002)
+used identical executable bytes and test arguments. Inbox WARP
+`10.0.26100.33648` failed the concurrent shader/VALU controls and ignored
+depth bounds with ordinary depth testing disabled. WARP `1.0.22.0` passed
+all three concurrent runs (83 tests each), seven isolated VALU tests, 496
+LDS cases, the compressed-copy control and all 14 depth cases. Both drivers
+had clean depth-fixture validation except for the two intentionally
+inverted intervals. This establishes the software baseline for these
+controls; physical GPU and title results remain separate.
+
+For an offline installation, pass `-WarpPackagePath` with an existing copy
+of the exact pinned `.nupkg` to either runner. The same integrity checks
+apply. `Initialize-VictoryWarp.ps1` also supports explicit application
+directories. Matching files are reused; a different existing runtime is
+rejected unless that helper is explicitly given
+`-ExistingDllPolicy ReplaceDifferent`. The downloaded development runtime
+and symbols are local dependencies and are excluded from CI uploads.
+
 ## Check a source change without game files
 
 From the repository root:
@@ -73,11 +99,13 @@ tests, checks all targets/features, tests the diagnostics harness and checks
 the asset policy. Windows-only tests remain the responsibility of the
 Windows job; Linux success is not a Windows runtime result.
 
-### Capture the intermittent native shader crash
+### Capture native regressions
 
-The post-merge Windows run exposed an access violation in the concurrent
-shader suite even after isolated checks passed. To collect its actual native
-stack, install the Windows SDK Debugging Tools and run:
+The post-merge inbox-WARP run exposed an access violation in the concurrent
+shader suite even after isolated checks passed. The pinned runtime resolved
+that failure in the controlled comparison. To repeat the concurrent controls
+and retain native diagnostics for any regression, install the Windows SDK
+Debugging Tools and run:
 
 ```powershell
 pwsh -NoProfile -File scripts/Test-Victory.ps1 -RequireGpu -NativeShaderDebug
@@ -129,9 +157,11 @@ failure. The existing target directory and installed Windows files are
 unchanged. The package is for testing and development; its binaries and
 symbols are excluded from the repository and CI artifacts.
 
-CI currently runs this comparison after the normal Windows gate, retaining
-failures in both. This is a diagnostic comparison, not a claim that either
-runtime passes or that a physical GPU/title has been tested.
+Normal CI runs the complete gate with pinned WARP. A manual workflow run
+can additionally select `compare_inbox_warp`; that diagnostic comparison
+still fails when an inbox control fails. Its known failures are retained
+as evidence rather than reclassified as passing tests. Neither workflow
+establishes physical GPU compatibility or title rendering.
 
 ### Optional independent DXIL validation
 
@@ -225,6 +255,11 @@ and check that previously working programs retain their results.
 The runner launches no title unless `-GameExe` is provided. Each invocation
 creates a unique report directory; each matrix case gets independent cache
 and save directories. It uses WARP unless `-Hardware` is explicitly supplied.
+Software shader scans and title runs use an identical copy of the built
+executable in the report's `application` directory, beside the verified
+pinned WARP runtime. Its executable hash and prepared runtime files are
+recorded; the title input remains at the supplied external path. Hardware
+runs use the normal built executable and actual adapter diagnostics.
 
 ```powershell
 pwsh -NoProfile -File scripts/Invoke-VictoryDiagnostics.ps1 `
