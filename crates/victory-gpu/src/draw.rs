@@ -24,7 +24,7 @@ use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
 #[cfg(test)]
-mod constant_tests;
+pub(crate) mod constant_tests;
 
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
@@ -322,6 +322,17 @@ impl State {
         }
     }
 
+    pub(crate) fn clear_vertex_buffers(&mut self, start: u32, count: u32) {
+        for slot in self
+            .vertex
+            .iter_mut()
+            .skip(start as usize)
+            .take(count as usize)
+        {
+            *slot = VertexView::default();
+        }
+    }
+
     pub(crate) fn set_index_buffer(&mut self, view: Option<&IndexView>) {
         self.index = view.copied().unwrap_or_default();
     }
@@ -540,7 +551,10 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
-            let made = self.tables(list, &t.used, compute);
+            let Some(made) = self.tables(list, &t.used, compute) else {
+                once!("a draw or dispatch dropped: no dynamic slots for its tables");
+                return false;
+            };
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
@@ -719,7 +733,12 @@ impl State {
     /// once: its aligned buffers are recopied before each draw, and the
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
-    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
+    fn tables(
+        &mut self,
+        list: &HostList,
+        used: &[UsedResource],
+        compute: bool,
+    ) -> Option<Vec<(u8, u32)>> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = used
             .iter()
@@ -808,9 +827,10 @@ impl State {
                 made.push((slot, fresh.first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
-                continue;
-            };
+            // Falling back to the title's original table is invalid: its
+            // constant slots have no native aligned CBV. The shared bind
+            // path drops direct and indirect work if allocation fails.
+            let first = host.dynamic(n)?;
             let mut constants = Vec::new();
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
@@ -853,7 +873,7 @@ impl State {
                 .insert(key, FreshTable { first, constants });
             made.push((slot, first * 32));
         }
-        made
+        Some(made)
     }
 
     /// The first draws, at debug level: what they bind and read

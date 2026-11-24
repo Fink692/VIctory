@@ -9,14 +9,14 @@ use windows::core::{PCSTR, s};
 
 type Messages = std::sync::Mutex<Vec<String>>;
 
-struct Validation {
+pub(crate) struct Validation {
     queue: ID3D12InfoQueue1,
     messages: Box<Messages>,
     cookie: u32,
 }
 
 impl Validation {
-    fn new(device: &ID3D12Device) -> Self {
+    pub(crate) fn new(device: &ID3D12Device) -> Self {
         unsafe extern "system" fn message(
             _: D3D12_MESSAGE_CATEGORY,
             severity: D3D12_MESSAGE_SEVERITY,
@@ -65,7 +65,7 @@ impl Validation {
         result
     }
 
-    fn check(&self) {
+    pub(crate) fn check(&self) {
         let messages = self.messages.lock().unwrap_or_else(|e| e.into_inner());
         assert!(
             messages.is_empty(),
@@ -334,7 +334,10 @@ impl Reader {
                     user_data: 0,
                     slot: 0,
                 }];
-                let made = self.state.tables(list, &used, true);
+                let made = self
+                    .state
+                    .tables(list, &used, true)
+                    .expect("constant descriptor table");
                 assert_eq!(made.len(), 1);
                 assert_eq!(made[0].0, 0);
                 let native = &heap.host().unwrap().heap;
@@ -378,6 +381,116 @@ impl Reader {
 
 const FIRST: [u32; 4] = [0x1020_3040, 0x5566_7788, 0x90ab_cdef, 0x0102_0304];
 const SECOND: [u32; 4] = [0xffee_ddcc, 0xbbaa_9988, 0x7654_3210, 0x1357_9bdf];
+
+#[test]
+#[ignore = "requires diagnostics, D3D12 and VICTORY_D3D12_DEBUG=1"]
+fn exhausted_constant_tables_drop_dispatches_and_recover() {
+    use crate::pipeline::host::{HostPipeline, Stage};
+    use crate::pipeline::{Shader, Translated};
+    use victory_shader::emit::HostShader;
+
+    let host = host();
+    let validation = Validation::new(&host.device);
+    let mut input = TitleBuffer::new(256, 0);
+    input.set(0, FIRST);
+    let mut reader = Reader::new(Binding::Table);
+    let heap = crate::descriptor::heap(reader.heap.0);
+    crate::descriptor::create_cbv(
+        std::ptr::null(),
+        &[
+            input.address() as u32,
+            (input.address() >> 32) as u32,
+            16,
+            0,
+        ],
+        heap.start,
+    );
+    let shader = Shader::from_translation_for_test(Translated {
+        host: HostShader {
+            stage: victory_shader::HwStage::Cs,
+            dxil: Vec::new(),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+        },
+        used: vec![UsedResource {
+            kind: ResourceType::Cbv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }],
+    });
+    let pipeline = crate::pipeline::from_host_for_test(HostPipeline {
+        compute: true,
+        mesh: false,
+        pso: reader.program.pso.clone(),
+        root: reader.program.root.clone(),
+        stages: vec![Stage {
+            shader,
+            user_data: None,
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+        }],
+        slots: 0,
+        inputs: Vec::new(),
+        name: "authored-exhaustion-fixture".into(),
+    });
+    reader.state.set_pipeline(pipeline);
+    let native = heap.host().unwrap();
+    // SAFETY: a live heap; its tail is exactly the allocator's capacity.
+    let count = unsafe { native.heap.GetDesc() }.NumDescriptors - native.count();
+    let first = native
+        .dynamic(count)
+        .expect("reserve every dynamic descriptor");
+    assert!(native.dynamic(1).is_none());
+
+    let output = Output::new(2);
+    let list = host.new_list().unwrap();
+    // Prebind output state so the only missing input is the required CBV.
+    // With the old code the dispatch proceeded, using an invalid table.
+    list.bind_buffer(&output.buffer, true);
+    assert!(list.finish_buffer_bindings());
+    // SAFETY: authored signature and live output buffer; no GPU use yet.
+    unsafe {
+        list.list.SetComputeRootSignature(&reader.program.root);
+        list.list
+            .SetComputeRootUnorderedAccessView(1, output.buffer.GetGPUVirtualAddress());
+        let parameters = [16u32, 0u32];
+        list.list
+            .SetComputeRoot32BitConstants(2, 2, parameters.as_ptr().cast(), 0);
+    }
+    let before = dispatched();
+    reader.state.dispatch(&list, 1, 1, 1);
+    assert_eq!(dispatched(), before, "exhaustion must record no dispatch");
+    assert!(reader.state.dynamic.is_empty());
+    assert!(reader.state.fresh_tables.is_empty());
+    list.close();
+    host.execute(&[&list]);
+    output.check(&[[0xa5a5_a5a5; 4]; 2]);
+    validation.check();
+
+    // Returning one slot lets a new table be built. A subsequent use of
+    // that cached table still succeeds with the pool completely full.
+    native.release(first, 1);
+    let list = host.new_list().unwrap();
+    let first_binding = reader.dispatch(&list, input.address(), 16, &output, 0, 0);
+    assert!(native.dynamic(1).is_none());
+    let second_binding = reader.dispatch(&list, input.address(), 16, &output, 1, 0);
+    assert_eq!(first_binding, second_binding);
+    list.close();
+    host.execute(&[&list]);
+    output.check(&[FIRST, FIRST]);
+    validation.check();
+    native.release(first + 1, count - 1);
+    slot::<extern "system" fn(This) -> u32>(pipeline, 0x10)(pipeline);
+    println!("VICTORY_DESCRIPTOR_EXHAUSTION_RESULT=executed cases=3 validation_errors=0");
+}
 
 #[test]
 #[ignore = "requires diagnostics, D3D12 and VICTORY_D3D12_DEBUG=1"]

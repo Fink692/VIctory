@@ -522,16 +522,26 @@ fn gpu_rectangles_observe_copies_formats_and_rebind_draw_state() {
     run_fixture(&mixed, &validation);
     completed(&mut cases, &mixed.label, &validation);
 
-    let half_cases = [
-        ([0x3e00u16, 0, 0x37fe], 0x3c00u16), // legacy mantissa-carry OR
-        ([0x0001, 0, 0], 0),
-        ([0x8001, 0, 0], 0x8000),
+    let mut half_cases = vec![
+        ([0x3e00u16, 0, 0x37fe], 0x4000u16), // carry into the next exponent
+        ([0x0001, 0, 0], 0x0001),
+        ([0x8001, 0, 0], 0x8001),
         ([0x7bff, 0, 0x7bff], 0x7c00),
         ([0xfbff, 0, 0xfbff], 0xfc00),
         ([0x8000, 0, 0x8000], 0x8000),
         ([0x3c00, 0x4000, 0x4200], 0x4000),
-        ([0x0400, 0x0001, 0], 0),
+        ([0x0400, 0x0001, 0], 0x03ff),
+        ([0x3c00, 0x0c00, 0x3c00], 0x4000),
+        ([0xbc00, 0x8c00, 0xbc00], 0xc000),
     ];
+    // All 2,046 signed half subnormals must survive arithmetic and
+    // encoding. Expected bits come directly from the input truth table.
+    for sign in [0, 0x8000] {
+        for mantissa in 1..=1023 {
+            let bits = sign | mantissa;
+            half_cases.push(([bits, 0, 0], bits));
+        }
+    }
     let mut half = Fixture {
         label: "half-signed-zero-subnormal-overflow-carry".into(),
         bytes: vec![0x71; 3 + half_cases.len() * 3 * 7],

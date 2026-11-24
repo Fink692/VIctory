@@ -23,7 +23,9 @@ static MISSES: AtomicU64 = AtomicU64::new(0);
 
 // Version 4 bounds single-dword LDS reads, writes and atomics before access.
 // The executable fingerprint also invalidates any rebuilt emitter.
-const CACHE_VERSION: u32 = 4;
+// Known-stride byte accesses now use structured handles, matching the
+// host's structured views while retaining their alignment and extent.
+const CACHE_VERSION: u32 = 6;
 
 /// Keeps translated shaders in `dir` from now on.
 pub fn use_shader_cache(dir: PathBuf) {

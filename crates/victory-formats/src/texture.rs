@@ -13,7 +13,7 @@
 //! (`ComputeSurfaceInfoMacroTiled`, `ComputeThinBlockDimension`,
 //! `GetMipTailDim`, `GetMaxNumMipsInTail`, `HwlComputeSurfaceInfoLinear`,
 //! `ComputeSurfaceAddrFromCoordMacroTiled`), and the 256-byte micro tile
-//! patterns in [`MICRO`] from `gfx10SwizzlePattern.h` (the RB+ tables, as on
+//! patterns in `MICRO` from `gfx10SwizzlePattern.h` (the RB+ tables, as on
 //! RDNA2). addrlib carries this notice:
 //!
 //! Copyright (C) 2007-2026 Advanced Micro Devices, Inc. All rights reserved.
@@ -330,13 +330,18 @@ impl Layout {
         let element_log2 = d.element_bytes.trailing_zeros();
         let bpe = u64::from(d.element_bytes);
         let block_bytes = 1u64 << block_log2;
-        let thick = d.dimension == Dimension::Tex3d && (d.swizzle.standard() || d.swizzle.display());
+        let thick =
+            d.dimension == Dimension::Tex3d && (d.swizzle.standard() || d.swizzle.display());
         let block = if thick {
             // ComputeThickBlockDimension
             let amp = (block_log2 - 10) / 3;
             let rest = (block_log2 - 10) % 3;
             let b = BLOCK_1K_3D[element_log2 as usize];
-            [b[0] << amp, b[1] << (amp + rest / 2), b[2] << (amp + u32::from(rest != 0))]
+            [
+                b[0] << amp,
+                b[1] << (amp + rest / 2),
+                b[2] << (amp + u32::from(rest != 0)),
+            ]
         } else {
             // ComputeThinBlockDimension
             let samples_log2 = d.samples.trailing_zeros();
@@ -352,7 +357,12 @@ impl Layout {
         let mip_depth = |i: u32| if thick { padded_dim(d.depth, i, 1) } else { 1 };
         let depth_of = |i: u32| if three_d { dim(d.depth, i, 1) } else { 1 };
         let (width, height) = (|i| dim(d.width, i, d.block), |i| dim(d.height, i, d.block));
-        let padded = |i| (padded_dim(d.width, i, d.block), padded_dim(d.height, i, d.block));
+        let padded = |i| {
+            (
+                padded_dim(d.width, i, d.block),
+                padded_dim(d.height, i, d.block),
+            )
+        };
         let mut mips = Vec::with_capacity(d.mips as usize);
         let mut first_tail_mip = d.mips;
         let mut slice_size = 0u64;
@@ -367,10 +377,8 @@ impl Layout {
                 offset: 0,
                 tail: None,
             });
-            slice_size = u64::from(mips[0].pitch)
-                * u64::from(mips[0].rows)
-                * bpe
-                * u64::from(d.samples);
+            slice_size =
+                u64::from(mips[0].pitch) * u64::from(mips[0].rows) * bpe * u64::from(d.samples);
         } else {
             // GetMipTailDim: the largest mip the tail takes.
             let mut tail_max = block;
@@ -564,7 +572,8 @@ impl Layout {
         // offset inside the tail block.
         let y = y + m.tail.map_or(0, |t| t.y);
         let blocks = u64::from(y / bh) * u64::from(m.pitch / bw);
-        (blocks << log2) + u64::from(self.pattern[1][(y % bh) as usize] | self.pattern[2][z as usize])
+        (blocks << log2)
+            + u64::from(self.pattern[1][(y % bh) as usize] | self.pattern[2][z as usize])
     }
 
     /// The part of an address that depends on the column.
@@ -594,9 +603,17 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
-            linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
-        })
+        self.walk(
+            tiled.len(),
+            mip,
+            slice,
+            linear.len(),
+            row_pitch,
+            depth_pitch,
+            |t, l, len| {
+                linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
+            },
+        )
     }
 
     /// The reverse of [`Layout::detile`]: linear rows into tiled memory.
@@ -609,9 +626,17 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
-            tiled[t..][..len].copy_from_slice(&linear[l..][..len]);
-        })
+        self.walk(
+            tiled.len(),
+            mip,
+            slice,
+            linear.len(),
+            row_pitch,
+            depth_pitch,
+            |t, l, len| {
+                tiled[t..][..len].copy_from_slice(&linear[l..][..len]);
+            },
+        )
     }
 
     /// Visits contiguous runs as (tiled byte offset, linear byte offset, length).
@@ -671,6 +696,13 @@ impl Layout {
             }
             runs.push((first_tiled, first_linear, bytes - first_linear));
         }
+        // A mip can end partway through the last run. Check the other runs
+        // once so each row can copy them with a compile-time length.
+        let (body, last) = runs.split_at(runs.len().saturating_sub(1));
+        let run_len = body
+            .first()
+            .map(|run| run.2)
+            .filter(|&len| body.iter().all(|run| run.2 == len));
         for z in 0..depth {
             let (s, inner) = self.split(first + z);
             let base = u64::from(s) * self.slice_size + m.offset;
@@ -681,13 +713,30 @@ impl Layout {
                     copy(tiled_row as usize, linear_row, bytes);
                 } else {
                     let tiled_row = (base + self.row(m, y, inner)) as usize;
-                    for &(tiled, linear, len) in &runs {
-                        copy(tiled_row + tiled, linear_row + linear, len);
+                    match run_len {
+                        Some(8) => copy_runs::<8>(body, tiled_row, linear_row, &mut copy),
+                        Some(16) => copy_runs::<16>(body, tiled_row, linear_row, &mut copy),
+                        Some(32) => copy_runs::<32>(body, tiled_row, linear_row, &mut copy),
+                        _ => copy_runs::<0>(body, tiled_row, linear_row, &mut copy),
                     }
+                    copy_runs::<0>(last, tiled_row, linear_row, &mut copy);
                 }
             }
         }
         Ok(())
+    }
+}
+
+/// Copy micro-tile runs inline at a known width, or use each run's length for N = 0.
+fn copy_runs<const N: usize>(
+    runs: &[(usize, usize, usize)],
+    tiled_row: usize,
+    linear_row: usize,
+    copy: &mut impl FnMut(usize, usize, usize),
+) {
+    for &(tiled, linear, len) in runs {
+        let len = if N == 0 { len } else { N };
+        copy(tiled_row + tiled, linear_row + linear, len);
     }
 }
 
@@ -776,7 +825,14 @@ impl Texture {
             1
         };
         let mips = match desc.mips {
-            0 => 32 - desc.width.max(desc.height).max(depth3d).max(1).leading_zeros(),
+            0 => {
+                32 - desc
+                    .width
+                    .max(desc.height)
+                    .max(depth3d)
+                    .max(1)
+                    .leading_zeros()
+            }
             n => n,
         };
         let plane = |bytes| Desc {
@@ -908,7 +964,11 @@ mod tests {
             let mut seen = vec![false; l.size as usize];
             let mut tiled = vec![0u8; l.size as usize];
             let n = d.element_bytes as usize;
-            let slices = if d.dimension == Dimension::Tex3d { 1 } else { d.depth };
+            let slices = if d.dimension == Dimension::Tex3d {
+                1
+            } else {
+                d.depth
+            };
             for slice in 0..slices {
                 for mip in 0..d.mips {
                     let m = l.mips[mip as usize];
@@ -937,7 +997,11 @@ mod tests {
                                 seen[at] = true;
                             }
                         }
-                        assert!(back[base + plane - 11..base + plane].iter().all(|&b| b == 0xcc));
+                        assert!(
+                            back[base + plane - 11..base + plane]
+                                .iter()
+                                .all(|&b| b == 0xcc)
+                        );
                     }
                 }
             }
@@ -1062,5 +1126,51 @@ mod tests {
             Err(Error::TooSmall)
         );
         assert_eq!(l.offset(0, 64, 0, 0), Err(Error::Invalid));
+    }
+
+    /// Compare the same authored inputs on two revisions, in a release build.
+    /// Output must still match before reporting throughput; no title data is used.
+    #[test]
+    #[ignore = "benchmark: cargo test --release -p victory-formats texture_copy_throughput -- --ignored --nocapture"]
+    fn texture_copy_throughput() {
+        for (width, height, bytes, swizzle) in [
+            (1024, 512, 4, Swizzle::SW_64KB_D),
+            (2048, 1024, 8, Swizzle::SW_64KB_D),
+            (1023, 769, 16, Swizzle::SW_4KB_S),
+        ] {
+            let layout = Layout::new(&desc(width, height, 1, bytes, swizzle)).unwrap();
+            let row = width as usize * bytes as usize;
+            let input: Vec<u8> = (0..row * height as usize)
+                .map(|i| (i.wrapping_mul(17) ^ (i >> 8)) as u8)
+                .collect();
+            let mut tiled = vec![0; layout.size as usize];
+            let mut output = vec![0; input.len()];
+            layout.tile(&mut tiled, 0, 0, &input, row, 0).unwrap();
+            layout.detile(&tiled, 0, 0, &mut output, row, 0).unwrap();
+            assert_eq!(output, input);
+            let runs = 32;
+            for tiling in [false, true] {
+                let started = std::time::Instant::now();
+                for _ in 0..runs {
+                    if tiling {
+                        layout
+                            .tile(std::hint::black_box(&mut tiled), 0, 0, &input, row, 0)
+                            .unwrap();
+                    } else {
+                        layout
+                            .detile(&tiled, 0, 0, std::hint::black_box(&mut output), row, 0)
+                            .unwrap();
+                    }
+                }
+                let seconds = started.elapsed().as_secs_f64() / f64::from(runs);
+                println!(
+                    "TEXTURE {width}x{height}x{bytes} {}: {:.1} MB/s",
+                    if tiling { "tile" } else { "detile" },
+                    input.len() as f64 / seconds / 1e6
+                );
+            }
+            layout.detile(&tiled, 0, 0, &mut output, row, 0).unwrap();
+            assert_eq!(output, input);
+        }
     }
 }

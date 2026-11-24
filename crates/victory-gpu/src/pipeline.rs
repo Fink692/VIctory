@@ -105,6 +105,18 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
+    /// Authored native fixtures supply their own binding metadata without
+    /// embedding any title container or invoking the console translator.
+    #[cfg(test)]
+    pub(crate) fn from_translation_for_test(translated: Translated) -> Arc<Self> {
+        Arc::new(Self {
+            stage: "compute",
+            hash: "authored-fixture".into(),
+            container: Vec::new(),
+            translated: OnceLock::from(Some(translated)),
+        })
+    }
+
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
@@ -507,6 +519,8 @@ pub(crate) mod host;
 mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(any(windows, test))]
+mod scheduling;
 
 /// Keeps compiled host pipelines, and the list of title pipelines to start
 /// early, in `dir` (a folder of the cache) across runs.
