@@ -10,11 +10,13 @@ failing instead of counting a missing validator/adapter as a passing test.
 param(
     [string]$OutputRoot = (Join-Path ([IO.Path]::GetTempPath()) 'victory-checks'),
     [string]$FormatBaseRef = 'origin/main',
-    [switch]$RequireGpu
+    [switch]$RequireGpu,
+    [switch]$NativeShaderDebug
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 if (-not $IsWindows) { throw 'Test-Victory.ps1 requires Windows x64 and the MSVC build tools.' }
+if ($NativeShaderDebug -and -not $RequireGpu) { throw '-NativeShaderDebug requires -RequireGpu.' }
 . (Join-Path $PSScriptRoot 'Diagnostics.Common.ps1')
 $report = New-VictoryReportDirectory $OutputRoot 'checks'
 $config = Join-Path $report 'victory.toml'
@@ -34,14 +36,15 @@ $summary = [ordered]@{
     started_at_utc = [DateTime]::UtcNow.ToString('o')
     status = 'running'
     require_gpu = [bool]$RequireGpu
+    native_shader_debug = [bool]$NativeShaderDebug
     formatting_base = $FormatBaseRef
     formatting_scope = 'Complete changed Rust files; full workspace when rustfmt configuration changes.'
     checks = $checks
-    limitations = @('No game files are executed.', 'Console-SDK differential tests and ignored reference-data tests are not part of this gate.', 'WARP does not establish physical GPU compatibility or world rendering.', 'Optional atomic64 execution checks may be unsupported; inspect each coverage result.')
+    limitations = @('No game files are executed.', 'Console-SDK differential tests and ignored reference-data tests are not part of this gate.', 'WARP does not establish physical GPU compatibility or world rendering.', 'Optional atomic64 and depth-bounds checks may be unsupported; inspect each coverage result.')
 }
 
 function Invoke-Check {
-    param([string]$Name, [string]$Executable, [string[]]$Arguments, [switch]$MustRunOneTest, [switch]$MustValidateAtomicMatrix, [switch]$OptionalAtomicSemantics, [hashtable]$EnvironmentOverrides = @{})
+    param([string]$Name, [string]$Executable, [string[]]$Arguments, [switch]$MustRunOneTest, [switch]$MustValidateAtomicMatrix, [switch]$OptionalAtomicSemantics, [switch]$MustValidateLdsMatrix, [switch]$MustExecuteLds, [switch]$OptionalDepthBounds, [hashtable]$EnvironmentOverrides = @{})
     Write-Host "Checking $Name..."
     $checkEnvironment = $environment.Clone()
     foreach ($key in $EnvironmentOverrides.Keys) { $checkEnvironment[$key] = $EnvironmentOverrides[$key] }
@@ -50,12 +53,18 @@ function Invoke-Check {
     if ($EnvironmentOverrides.Count -gt 0) { $check['environment_overrides'] = $EnvironmentOverrides }
     $checks.Add($check)
     Assert-VictoryProcessSucceeded $result $Name
-    if ($MustRunOneTest -or $MustValidateAtomicMatrix -or $OptionalAtomicSemantics) {
+    if ($MustRunOneTest -or $MustValidateAtomicMatrix -or $OptionalAtomicSemantics -or $MustValidateLdsMatrix -or $MustExecuteLds -or $OptionalDepthBounds) {
         $output = (Get-Content -LiteralPath $result.stdout_log -Raw) + (Get-Content -LiteralPath $result.stderr_log -Raw)
         if ($output -notmatch 'test result: ok\. 1 passed;' -or ($MustRunOneTest -and $output -match '; skipped')) {
             throw "$Name did not run its required test successfully. See $($result.stdout_log)."
         }
         if ($MustValidateAtomicMatrix) { $check['coverage'] = Get-VictoryAtomicValidationCoverage $output }
+        if ($MustValidateLdsMatrix) { $check['coverage'] = Get-VictoryLdsValidationCoverage $output }
+        if ($MustExecuteLds) { $check['coverage'] = Get-VictoryLdsCoverage $output }
+        if ($OptionalDepthBounds) {
+            $check['coverage'] = Get-VictoryDepthBoundsCoverage $output
+            Write-Host "$Name coverage: $($check.coverage.status); cases=$($check.coverage.cases)."
+        }
         if ($OptionalAtomicSemantics) {
             $check['coverage'] = Get-VictoryAtomic64Coverage $output
             Write-Host "$Name coverage: $($check.coverage.status); adapters=$($check.coverage.adapters); cases=$($check.coverage.cases)."
@@ -86,6 +95,17 @@ try {
         Invoke-Check 'warp-pipeline' 'cargo' @('test', '--locked', '-p', 'victory-shader', '--all-features', 'emit::tests::stub_pipeline_is_created', '--', '--exact', '--nocapture') -MustRunOneTest
         Invoke-Check 'atomic64-unguarded-semantics' 'cargo' @('test', '--locked', '-p', 'victory-shader', '--all-features', 'emit::atomic_tests::image_atomic64_results_match_integer_semantics', '--', '--exact', '--nocapture') -OptionalAtomicSemantics -EnvironmentOverrides @{ VICTORY_D3D12_DEBUG = '1' }
         Invoke-Check 'atomic64-guarded-semantics' 'cargo' @('test', '--locked', '-p', 'victory-shader', '--all-features', 'emit::atomic_tests::guarded_image_atomic64_results_match_integer_semantics', '--', '--exact', '--nocapture') -OptionalAtomicSemantics -EnvironmentOverrides @{ VICTORY_D3D12_DEBUG = '1' }
+        if ($NativeShaderDebug) {
+            Invoke-Check 'native-shader-debug' (Get-Process -Id $PID).Path @('-NoProfile', '-NonInteractive', '-File', (Join-Path $PSScriptRoot 'Test-NativeShader.ps1'), '-OutputRoot', $report)
+        }
+        Invoke-Check 'lds-dxil-validator' 'cargo' @('test', '--locked', '-p', 'victory-shader', '--all-features', 'emit::lds_tests::lds_subword_programs_translate_and_validate', '--', '--exact', '--nocapture') -MustRunOneTest -MustValidateLdsMatrix
+        Invoke-Check 'lds-semantics' 'cargo' @('test', '--locked', '-p', 'victory-shader', '--all-features', 'emit::lds_tests::lds_subword_results_preserve_adjacent_bytes', '--', '--exact', '--nocapture') -MustRunOneTest -MustExecuteLds
+        Invoke-Check 'warp-depth-bounds' 'cargo' @('test', '--locked', '-p', 'victory-gpu', '--all-features', 'pipeline::host::depth_bounds_tests::depth_bounds_filter_stored_depth_and_reset', '--', '--ignored', '--exact', '--nocapture') -OptionalDepthBounds -EnvironmentOverrides @{ VICTORY_D3D12_DEBUG = '1' }
+        Invoke-Check 'warp-texture-copy-order' 'cargo' @('test', '--locked', '-p', 'victory-gpu', '--all-features', 'resource::copy_tests::gpu_texture_copies_preserve_order_and_guards', '--', '--ignored', '--exact', '--nocapture') -MustRunOneTest -EnvironmentOverrides @{ VICTORY_D3D12_DEBUG = '1' }
+        Invoke-Check 'warp-texture-copy-lists' 'cargo' @('test', '--locked', '-p', 'victory-gpu', '--all-features', 'resource::copy_tests::texture_readback_crosses_lists_and_reuses_subresources', '--', '--ignored', '--exact', '--nocapture') -MustRunOneTest -EnvironmentOverrides @{ VICTORY_D3D12_DEBUG = '1' }
+        Invoke-Check 'warp-texture-copy-ranges' 'cargo' @('test', '--locked', '-p', 'victory-gpu', '--all-features', 'resource::copy_tests::invalid_texture_copy_ranges_leave_destination_unchanged', '--', '--ignored', '--exact', '--nocapture') -MustRunOneTest -EnvironmentOverrides @{ VICTORY_D3D12_DEBUG = '1' }
+        Invoke-Check 'warp-texture-copy-bc' 'cargo' @('test', '--locked', '-p', 'victory-gpu', '--all-features', 'resource::copy_tests::block_compressed_small_mips_round_trip', '--', '--ignored', '--exact', '--nocapture') -MustRunOneTest -EnvironmentOverrides @{ VICTORY_D3D12_DEBUG = '1' }
+        Invoke-Check 'warp-texture-copy-planes' 'cargo' @('test', '--locked', '-p', 'victory-gpu', '--all-features', 'resource::copy_tests::depth_stencil_copies_use_selected_plane_formats', '--', '--ignored', '--exact', '--nocapture') -MustRunOneTest -EnvironmentOverrides @{ VICTORY_D3D12_DEBUG = '1' }
         Invoke-Check 'warp-query-results' 'cargo' @('test', '--locked', '-p', 'victory-gpu', '--all-features', 'query::tests::timestamp_queries_execute_and_preserve_destination_guards', '--', '--ignored', '--exact', '--nocapture') -MustRunOneTest
         Invoke-Check 'warp-empty-queries' 'cargo' @('test', '--locked', '-p', 'victory-gpu', '--all-features', 'query::tests::empty_occlusion_and_pipeline_queries_return_measured_zeroes', '--', '--ignored', '--exact', '--nocapture') -MustRunOneTest
         Invoke-Check 'warp-query-copies' 'cargo' @('test', '--locked', '-p', 'victory-gpu', '--all-features', 'query::tests::resolved_queries_feed_gpu_copies_across_lists', '--', '--ignored', '--exact', '--nocapture') -MustRunOneTest

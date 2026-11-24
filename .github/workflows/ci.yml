@@ -62,7 +62,7 @@ jobs:
       - name: Validate synthetic tests and Windows builds
         env:
           FORMAT_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before || inputs.format_base_ref }}
-        run: ./scripts/Test-Victory.ps1 -RequireGpu -FormatBaseRef "$env:FORMAT_BASE_REF" -OutputRoot "$env:RUNNER_TEMP/victory-checks"
+        run: ./scripts/Test-Victory.ps1 -RequireGpu -NativeShaderDebug -FormatBaseRef "$env:FORMAT_BASE_REF" -OutputRoot "$env:RUNNER_TEMP/victory-checks"
       - name: Keep asset-free validation logs
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -73,5 +73,7 @@ jobs:
             ${{ runner.temp }}/victory-checks/**/*.process.json
             ${{ runner.temp }}/victory-checks/**/*.stdout.log
             ${{ runner.temp }}/victory-checks/**/*.stderr.log
+            ${{ runner.temp }}/victory-checks/**/*.native.log
+            ${{ runner.temp }}/victory-checks/**/native-shader.json
           if-no-files-found: ignore
           retention-days: 7

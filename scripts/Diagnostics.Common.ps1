@@ -167,3 +167,53 @@ function Get-VictoryAtomicValidationCoverage {
     }
     return [ordered]@{ status = 'validated'; containers = 88 }
 }
+
+function Get-VictoryLdsValidationCoverage {
+    param([Parameter(Mandatory)][string]$Output)
+    $coverageMatches = [regex]::Matches($Output, '(?m)^VICTORY_LDS_VALIDATION_RESULT=validated containers=(\d+)\r?$')
+    if ($coverageMatches.Count -ne 1 -or [uint64]$coverageMatches[0].Groups[1].Value -ne 168) {
+        throw 'The LDS validation test must confirm independent validation of all 168 synthetic containers.'
+    }
+    return [ordered]@{ status = 'validated'; containers = 168 }
+}
+
+function Get-VictoryLdsCoverage {
+    param([Parameter(Mandatory)][string]$Output)
+    $coverageMatches = [regex]::Matches($Output, '(?m)^VICTORY_LDS_RESULT=executed adapters=(\d+) cases=(\d+)\r?$')
+    if ($coverageMatches.Count -ne 1) { throw 'The LDS test must report exactly one execution result.' }
+    $adapters = [uint64]$coverageMatches[0].Groups[1].Value
+    $cases = [uint64]$coverageMatches[0].Groups[2].Value
+    if ($adapters -eq 0 -or $cases -ne ($adapters * 496)) {
+        throw 'The LDS test must execute all 496 cases on each reported adapter.'
+    }
+    return [ordered]@{ status = 'executed'; adapters = $adapters; cases = $cases }
+}
+
+function Get-VictoryDepthBoundsCoverage {
+    param([Parameter(Mandatory)][string]$Output)
+    $coverageMatches = [regex]::Matches($Output, '(?m)^VICTORY_DEPTH_BOUNDS_RESULT=(executed|unsupported) cases=(\d+)\r?$')
+    if ($coverageMatches.Count -ne 1) { throw 'The depth-bounds test must report exactly one execution/capability result.' }
+    $status = $coverageMatches[0].Groups[1].Value
+    $cases = [uint64]$coverageMatches[0].Groups[2].Value
+    if (($status -eq 'executed' -and $cases -ne 14) -or ($status -eq 'unsupported' -and $cases -ne 0)) {
+        throw 'The depth-bounds test must execute all 14 cases or report unsupported with zero executed cases.'
+    }
+    return [ordered]@{ status = $status; cases = $cases }
+}
+
+function Get-VictoryNativeShaderCoverage {
+    param([Parameter(Mandatory)][string]$Output)
+    if ($Output -notmatch '(?m)^VICTORY_NATIVE_DEBUGGER_READY\r?$') {
+        throw 'The native debugger did not confirm its exception configuration.'
+    }
+    if ($Output -match '(?m)^VICTORY_NATIVE_UNHANDLED\r?$' -or $Output -match 'test result: FAILED\.') {
+        throw 'The native shader run reported an unhandled exception or failed Rust tests.'
+    }
+    # CDB can echo the same terminal result into both its own log and stdout.
+    # Deduplicate those copies, but reject different or missing terminal results.
+    $results = @([regex]::Matches($Output, '(?m)^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;[^\r\n]*') | ForEach-Object { $_.Value } | Select-Object -Unique)
+    if ($results.Count -ne 1 -or $results[0] -notmatch '^test result: ok\. ([1-9]\d*) passed; 0 failed; (\d+) ignored;') {
+        throw 'The native shader run did not complete exactly one successful Rust test suite.'
+    }
+    return [ordered]@{ status = 'completed'; passed = [uint32]$Matches[1]; ignored = [uint32]$Matches[2] }
+}

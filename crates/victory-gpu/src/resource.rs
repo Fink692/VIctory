@@ -63,6 +63,9 @@ const RESOURCE_IIDS: [Iid; 4] = [
 const KIB_64: u64 = 64 << 10;
 const MIB_4: u64 = 4 << 20;
 
+#[cfg(all(test, windows))]
+mod copy_tests;
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HeapProperties {
@@ -317,20 +320,30 @@ fn mip_count(desc: &ResourceDesc) -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlacedFootprint {
     pub(crate) offset: u64,
-    format: u32,
-    width: u32,
-    height: u32,
-    depth: u32,
-    row_pitch: u32,
+    pub(crate) format: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) depth: u32,
+    pub(crate) row_pitch: u32,
 }
 
 impl PlacedFootprint {
     /// The bytes it spans in a buffer: every row pitched but the last.
     pub(crate) fn bytes(&self) -> Option<u64> {
         let (element, block) = element(self.format)?;
-        let lines = u64::from(self.height).div_ceil(block) * u64::from(self.depth);
-        let last = u64::from(self.width).div_ceil(block) * element;
-        Some(u64::from(self.row_pitch) * lines.saturating_sub(1) + last)
+        if self.width == 0 || self.height == 0 || self.depth == 0 {
+            return None;
+        }
+        let lines = u64::from(self.height)
+            .div_ceil(block)
+            .checked_mul(u64::from(self.depth))?;
+        let last = u64::from(self.width).div_ceil(block).checked_mul(element)?;
+        if last > u64::from(self.row_pitch) {
+            return None;
+        }
+        u64::from(self.row_pitch)
+            .checked_mul(lines.checked_sub(1)?)?
+            .checked_add(last)
     }
 }
 const _: () = assert!(size_of::<PlacedFootprint>() == 32);
@@ -1369,6 +1382,68 @@ mod tests {
         creation_nodes: 0,
         visible_nodes: 0,
     };
+
+    #[test]
+    fn copy_footprints_check_extents_without_charging_last_row_padding() {
+        let f = PlacedFootprint {
+            offset: 7,
+            format: 28,
+            width: 4,
+            height: 4,
+            depth: 1,
+            row_pitch: 20,
+        };
+        assert_eq!(f.bytes(), Some(76));
+        assert_eq!(PlacedFootprint { depth: 2, ..f }.bytes(), Some(156));
+        assert_eq!(PlacedFootprint { row_pitch: 15, ..f }.bytes(), None);
+        assert_eq!(PlacedFootprint { width: 0, ..f }.bytes(), None);
+        assert_eq!(PlacedFootprint { height: 0, ..f }.bytes(), None);
+        assert_eq!(PlacedFootprint { depth: 0, ..f }.bytes(), None);
+        assert_eq!(PlacedFootprint { format: 0, ..f }.bytes(), None);
+        assert_eq!(
+            PlacedFootprint {
+                width: u32::MAX,
+                ..f
+            }
+            .bytes(),
+            None
+        );
+        assert_eq!(
+            PlacedFootprint {
+                row_pitch: u32::MAX,
+                height: u32::MAX,
+                depth: u32::MAX,
+                ..f
+            }
+            .bytes(),
+            None
+        );
+    }
+
+    #[test]
+    fn copy_footprints_count_compressed_block_rows() {
+        let f = PlacedFootprint {
+            offset: 0,
+            format: 71,
+            width: 5,
+            height: 7,
+            depth: 2,
+            row_pitch: 24,
+        };
+        assert_eq!(f.bytes(), Some(88)); // Four rows of two BC1 blocks.
+        assert_eq!(
+            PlacedFootprint {
+                width: 1,
+                height: 1,
+                depth: 1,
+                row_pitch: 8,
+                ..f
+            }
+            .bytes(),
+            Some(8)
+        );
+        assert_eq!(PlacedFootprint { row_pitch: 15, ..f }.bytes(), None);
+    }
 
     fn buffer(width: u64) -> ResourceDesc {
         ResourceDesc {

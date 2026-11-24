@@ -112,9 +112,9 @@ pub struct Validator {
     object: Object,
 }
 
-// SAFETY: the validator object is free-threaded (DXC's validator has no
-// thread affinity); calls are serialised by `&mut self`.
-unsafe impl Send for Validator {}
+// DXC objects must be created and used on the same thread. The raw COM
+// pointer deliberately keeps this wrapper !Send and !Sync; offline workers
+// each construct their own validator. See Microsoft's DXCompiler DLL guide.
 
 impl Validator {
     /// Where `dxil.dll` is looked for.

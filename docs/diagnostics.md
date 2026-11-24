@@ -44,13 +44,22 @@ gate. These isolated checks request the D3D12 debug layer and run immediately
 after the basic WARP pipeline check. Their separate logs and flushed phase
 markers distinguish validator, pipeline and dispatch failures before the
 parallel workspace suite runs.
+
+The LDS matrix independently validates 168 byte/halfword shared-memory
+programs and requires 496 semantic dispatch cases per WARP adapter. These
+checks cannot pass through an unsupported-adapter skip. Texture-copy checks
+verify same-submission GPU input, partial readback with guard bytes,
+cross-list ordering and same-texture mip copies. The optional depth-bounds
+feature records either all 14 measured cases or `unsupported` with zero
+cases; a capability-query error is a failure.
+
 It saves a `checks.json` report and individual process logs under a unique
 directory in the system temporary folder. `-OutputRoot D:\victory-runs`
 selects another external directory. Omitting `-RequireGpu` permits the
 existing optional GPU tests to skip on machines without their prerequisites;
 that result does not satisfy the strict GPU gate.
 
-CI runs the same strict command on `windows-2025` for pull requests and
+CI adds `-NativeShaderDebug` to the strict command on `windows-2025` for pull requests and
 pushes to `main`, with read-only repository permissions. It uploads only the
 asset-free check logs and metadata. Existing console-SDK differential tests
 and ignored tests requiring reference game data are **not** exercised by
@@ -59,6 +68,25 @@ An independent `ubuntu-24.04` job runs all platform-independent workspace
 tests, checks all targets/features, tests the diagnostics harness and checks
 the asset policy. Windows-only tests remain the responsibility of the
 Windows job; Linux success is not a Windows runtime result.
+
+### Capture the intermittent native shader crash
+
+The post-merge Windows run exposed an access violation in the concurrent
+shader suite even after isolated checks passed. To collect its actual native
+stack, install the Windows SDK Debugging Tools and run:
+
+```powershell
+pwsh -NoProfile -File scripts/Test-Victory.ps1 -RequireGpu -NativeShaderDebug
+```
+
+`Test-NativeShader.ps1` builds the exact shader test executable and runs it
+three times under x64 CDB with four test threads. Second-chance access
+violations capture the exception, registers, thread stacks and loaded-module
+names. The normal concurrent workspace test still runs afterward. A missing
+debugger, timeout, native exception or incomplete Rust result fails the gate.
+CI preserves `.native.log` and `native-shader.json` alongside the other
+synthetic logs; no process memory dumps are written. `-CdbPath`, `-Attempts`
+and `-TestThreads` are available when invoking the script directly.
 
 ### Optional independent DXIL validation
 
@@ -71,6 +99,9 @@ version and executable hash with your results, and run:
 $env:VICTORY_DXV = 'D:\tools\dxc\bin\x64\dxv.exe'
 cargo test --locked -p victory-shader --all-features `
   emit::atomic_tests::image_atomics_translate_in_both_widths_and_return_modes `
+  -- --exact --nocapture
+cargo test --locked -p victory-shader --all-features `
+  emit::lds_tests::lds_subword_programs_translate_and_validate `
   -- --exact --nocapture
 Remove-Item Env:VICTORY_DXV
 ```
