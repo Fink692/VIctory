@@ -7,7 +7,9 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_FAILED, WAIT_OBJECT_0, WPARAM,
+};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -490,26 +492,21 @@ const SCRATCH_CHUNK: u64 = 4 << 20;
 
 /// One piece of submission-time work, in recorded order.
 enum Step {
-    /// A copy of title memory into the list's own upload memory.
-    Fill(usize, usize, usize),
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
-    /// once per submission, whichever lists ask, until a `Run`
-    /// intervenes.
+    /// once per submission, whichever lists ask.
     Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
-    /// Work that may write title memory.
-    Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
-    /// whichever lists sample it, until a `Run` intervenes.
+    /// whichever lists sample it.
     Texture(std::sync::Arc<crate::texture::Staging>),
 }
 
-/// What a list does on the CPU when it is submitted: copies between host
-/// memory regions (title buffers, upload buffers and buffer copies), and
-/// the upload buffers its GPU commands read, kept until the list is reset.
+/// CPU preparation of the host data a submission reads, plus allocations
+/// its GPU commands need, kept until the list is reset. Title GPU copies
+/// themselves are recorded as native commands.
 #[derive(Default)]
 struct Deferred {
     /// Destination, source, bytes.
@@ -519,7 +516,7 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
-    /// Buffer ranges refreshed since the last title copy (host copy,
+    /// Buffer ranges refreshed by this list (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
@@ -842,15 +839,25 @@ impl Host {
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
-                    }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                if let Err(error) = self.queue.Signal(&self.fence, *submitted) {
+                    fail(format_args!("host submission fence signal failed: {error}"));
+                }
+                if let Err(error) = self.fence.SetEventOnCompletion(*submitted, self.event) {
+                    fail(format_args!("host submission fence event failed: {error}"));
+                }
+                // Copy-back and allocator reuse require proof that this
+                // submission finished. A failed wait must never fall through
+                // to CPU reads of memory the GPU may still be writing.
+                let waited = WaitForSingleObject(self.event, INFINITE);
+                if waited == WAIT_FAILED {
+                    let error = windows::core::Error::from_thread();
+                    fail(format_args!("host submission fence wait failed: {error}"));
+                }
+                if waited != WAIT_OBJECT_0 {
+                    fail(format_args!(
+                        "host submission fence wait returned unexpected status {:#x}",
+                        waited.0
+                    ));
                 }
             }
             #[cfg(feature = "diagnostics")]
@@ -1485,17 +1492,9 @@ impl HostList {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Copies `len` bytes of title memory at `src` into the list's upload
-    /// memory at `dst` when the list is submitted.
-    pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
-        self.deferred()
-            .copies
-            .push(Step::Fill(dst as usize, src as usize, len));
-    }
-
     /// Brings `[address, address + len)` of a buffer's host copy up to date
-    /// when the list is submitted (once per range until a title copy
-    /// intervenes), keeping the copy alive until the list is reset.
+    /// when the list is submitted (once per range), keeping the copy alive
+    /// until the list is reset.
     pub(crate) fn defer_refresh(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
@@ -1596,14 +1595,8 @@ impl HostList {
         self.deferred().textures.insert(key)
     }
 
-    /// Runs `work` when the list is submitted, in order with its copies.
-    /// `work` may write title memory (refreshes after it copy again).
-    pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
-    }
-
-    /// As [`HostList::defer`], for work that writes only host memory.
+    /// Prepares host memory when the list is submitted. GPU-produced
+    /// inputs must instead be consumed by a recorded native command.
     pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
         self.deferred().copies.push(Step::Host(Box::new(work)));
     }
@@ -1621,17 +1614,7 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
-            let started = std::time::Instant::now();
-            let copied = match step {
-                &Step::Fill(dst, src, len) => {
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        add(C::Copies, 1);
-                        add(C::CopyBytes, len as u64);
-                    }
-                    copy_mapped(dst as *mut u8, src as *const u8, len, false);
-                    len
-                }
+            match step {
                 Step::Refresh(shadow, address, len) => {
                     #[cfg(feature = "diagnostics")]
                     {
@@ -1639,51 +1622,44 @@ impl HostList {
                         add(C::RefreshBytes, *len as u64);
                     }
                     batch.add(shadow, *address, *len);
-                    continue;
                 }
-                Step::Run(work) | Step::Host(work) => {
-                    if matches!(step, Step::Run(_)) {
-                        batch.title_written();
-                    }
+                Step::Host(work) => {
+                    #[cfg(feature = "diagnostics")]
+                    let started = std::time::Instant::now();
                     work();
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Runs, 1);
                         add(C::RunUs, started.elapsed().as_micros() as u64);
                     }
-                    continue;
                 }
                 Step::GpuWrite(shadow, address, len) => {
                     // The shaders start from the title's data.
                     batch.flush();
                     shadow.writing(*address, *len);
-                    continue;
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
                         staging.refresh();
                     }
-                    continue;
                 }
-            };
-            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            }
         }
     }
 }
 
 /// A submission's refreshes not done yet, merged per buffer copy into the
-/// range that covers them: done before a step that writes title memory or
-/// gives a range to shaders, and before the lists run.
+/// range that covers them: done before a range is declared GPU-written,
+/// and before the lists run.
 ///
 /// Also the textures brought up to date in the submission so far: most
 /// lists of a world submission sample the same textures, and a texture in
 /// physical-page memory is hashed whole each time it is checked. Checked
-/// once, it is checked again only after a step that writes title memory.
+/// once, it is checked again on the next submission.
 #[derive(Default)]
 struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
-    /// Staging buffers (by address) refreshed since the last title write.
+    /// Staging buffers (by address) refreshed in this submission.
     textures: std::collections::HashSet<usize>,
 }
 
@@ -1705,13 +1681,6 @@ impl Batch {
     fn texture_due<T>(&mut self, staging: &std::sync::Arc<T>) -> bool {
         self.textures
             .insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
-    }
-
-    /// Before a step that writes title memory: pending refreshes are done
-    /// first, and textures are checked again after it.
-    fn title_written(&mut self) {
-        self.flush();
-        self.textures.clear();
     }
 
     fn flush(&mut self) {
@@ -2448,14 +2417,9 @@ mod batch {
     }
 
     #[test]
-    fn title_writes_make_textures_due_again() {
+    fn a_new_submission_checks_textures_again() {
         let mut batch = Batch::default();
         let a = Arc::new(1u32);
-        assert!(batch.texture_due(&a));
-        assert!(!batch.texture_due(&a));
-        // A copy into title memory or work that may write it may have
-        // changed the texture's memory.
-        batch.title_written();
         assert!(batch.texture_due(&a));
         assert!(!batch.texture_due(&a));
         // A fresh submission starts over.

@@ -81,6 +81,24 @@ cross-list ordering and same-texture mip copies. The optional depth-bounds
 feature records either all 14 measured cases or `unsupported` with zero
 cases; a capability-query error is a failure.
 
+The single-dword LDS checks independently validate 184 programs and require
+552 native cases per adapter for 32-bit reads, writes and supported atomics.
+They check allocation bounds, inactive lanes, signed/unsigned results and
+returned old values. Their coverage does not include multi-dword boundary
+or unaligned modes. Both atomic64 gates likewise require exactly 352 cases
+per reported adapter; a positive but incomplete count is a failure.
+
+Two constant-buffer tests run authored shaders through native root and table
+CBVs, checking GPU-produced inputs, cached-table updates between dispatches,
+reverse-recorded lists, repeated submissions, reset, padding and invalid
+ranges. A separate raw-address copy test exercises the title-facing command
+in six scenarios, including earlier GPU producers, later consumers and
+overlapping ranges. These tests retain debug-layer errors even when the host
+drains its message queue. CPU fence tests cover null-event waits, concurrent
+registration, independent targets and fence rewinds. Native submission
+failures stop before readback; the gate does not inject signal or event
+failures to test those terminating branches.
+
 It saves a `checks.json` report and individual process logs under a unique
 directory in the system temporary folder. `-OutputRoot D:\victory-runs`
 selects another external directory. Omitting `-RequireGpu` permits the
@@ -177,6 +195,9 @@ cargo test --locked -p victory-shader --all-features `
   -- --exact --nocapture
 cargo test --locked -p victory-shader --all-features `
   emit::lds_tests::lds_subword_programs_translate_and_validate `
+  -- --exact --nocapture
+cargo test --locked -p victory-shader --all-features `
+  emit::lds_dword_tests::lds_dword_programs_translate_and_validate `
   -- --exact --nocapture
 Remove-Item Env:VICTORY_DXV
 ```

@@ -2085,8 +2085,33 @@ impl<'a> Lower<'a> {
         if let Some((bits, signed)) = subword {
             return self.lds_subword(inst, a, offset, bits, signed, guard);
         }
+        if matches!(name, "ds_read_b32" | "ds_write_b32") {
+            let source = if name == "ds_write_b32" {
+                Some(self.vgprs(inst, data.first().ok_or("an LDS write")?, 1)?[0])
+            } else {
+                None
+            };
+            let (index, enabled) = self.lds_dword_address(a, offset, guard);
+            let at = self.begin_guarded(Some(enabled));
+            // The pointer and memory operation belong inside the bounds
+            // branch. Selecting zero after an invalid TGSM load is too late.
+            let lds = self.s.lds();
+            let ptr = self.s.m.element(self.cur, lds, index);
+            if let Some(value) = source {
+                self.s.m.store(self.cur, ptr, value);
+                self.end_guarded(at, &[]);
+            } else {
+                let value = self.s.m.load(self.cur, ptr);
+                let zero = self.s.m.i32(0);
+                let value = self.end_guarded(at, &[(value, zero)])[0];
+                let reg = dst_reg.ok_or("an LDS read result")?;
+                self.write(inst, Reg::V(reg), value, guard);
+            }
+            return Ok(());
+        }
         // shortcut: LDS addresses are taken as dword-aligned and in bounds
-        // (out-of-bounds console accesses read 0 and drop writes).
+        // for multi-dword and paired operations. Their partially crossing
+        // boundary/alignment modes still need separate RDNA2 evidence.
         let dword = |l: &mut Self, bytes: u32| -> V {
             let c = l.cur;
             let o = l.s.m.i32(bytes);
@@ -2180,13 +2205,10 @@ impl<'a> Lower<'a> {
             Some(d) => Some(self.vgprs(inst, d, 1)?[0]),
             None => None,
         };
-        let old_reg = dst_reg.and_then(|r| inst.read(Reg::V(r)).map(|v| (r, v)));
-        let outside = match old_reg {
-            Some((_, v)) => self.i32_of(v).unwrap_or(self.s.m.i32(0)),
-            None => self.s.m.i32(0),
-        };
-        let p = dword(self, offset);
-        let at = self.begin_guarded(guard);
+        let (index, enabled) = self.lds_dword_address(a, offset, guard);
+        let at = self.begin_guarded(Some(enabled));
+        let lds = self.s.lds();
+        let p = self.s.m.element(self.cur, lds, index);
         let r = match rmw {
             Some(op) => self.s.m.atomic(self.cur, op, p, v0),
             // Compare with data0, store data1.
@@ -2195,11 +2217,34 @@ impl<'a> Lower<'a> {
                 .m
                 .cmpxchg(self.cur, p, v0, v1.ok_or("an LDS compare")?),
         };
-        let r = self.end_guarded(at, &[(r, outside)])[0];
+        // An active out-of-range atomic reads zero and changes no memory;
+        // an inactive lane instead keeps its previous destination value.
+        let zero = self.s.m.i32(0);
+        let r = self.end_guarded(at, &[(r, zero)])[0];
         if let Some(reg) = dst_reg {
-            self.write(inst, Reg::V(reg), r, None);
+            self.write(inst, Reg::V(reg), r, guard);
         }
         Ok(())
+    }
+
+    /// Bounds for ordinary single-dword DS operations (RDNA2 ISA 3.6.1,
+    /// 3.6.6 and 10.4.3). M0 does not clamp these indexed accesses. Keep
+    /// the existing i32 address addition and dword alignment; this does
+    /// not introduce a new arithmetic-overflow or unaligned-mode policy.
+    /// Returns an index and guard, without forming a TGSM pointer.
+    fn lds_dword_address(&mut self, address: V, offset: u32, guard: Option<V>) -> (V, V) {
+        let c = self.cur;
+        let offset = self.s.m.i32(offset);
+        let byte = self.s.m.bin(c, Bin::Add, address, offset);
+        let two = self.s.m.i32(2);
+        let index = self.s.m.bin(c, Bin::LShr, byte, two);
+        let limit = self.s.m.i32(self.s.lds_dwords);
+        let valid = self.s.m.cmp(c, pred::IULT, index, limit);
+        let enabled = match guard {
+            Some(g) => self.s.m.bin(c, Bin::And, valid, g),
+            None => valid,
+        };
+        (index, enabled)
     }
 
     /// Byte and native-aligned halfword LDS accesses. Like the wider LDS

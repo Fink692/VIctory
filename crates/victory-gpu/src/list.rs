@@ -745,27 +745,23 @@ extern "system" fn clear_dsv(
     let _ = (this, handle, flags, depth, stencil, count, rects);
 }
 
-/// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
-/// are title memory, copied at submission like buffer copies (if mapped).
+/// `CopyMemoryToMemoryX(destination, source, size, flags)`: title GPU
+/// addresses use the same ordered host copies as buffer-resource copies.
+/// A CPU copy at submission would run before preceding GPU producers.
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && dst != 0
         && src != 0
     {
-        let len = len as usize;
-        list.defer(move || {
-            if crate::texture::committed(src as *const u8, len)
-                && crate::texture::committed(dst as *const u8, len)
-            {
-                // SAFETY: both ranges are committed title memory.
-                unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
-            }
-        });
+        copy_buffers(list, dst, src, len);
     }
     #[cfg(not(windows))]
     let _ = (this, dst, src, len);
 }
+
+#[cfg(all(test, windows))]
+mod memory_copy_tests;
 
 /// `DriverHintX(feature, value)`: no hints for the host.
 extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {

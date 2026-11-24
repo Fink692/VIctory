@@ -39,13 +39,13 @@ What each part does today and what it still needs:
 | Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
 | Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
 | GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
-| GPU: world | Mesh pipelines, shader-written buffers, descriptor lifetimes, bounded indirect execution, worker-created pipelines cached on disk; native queries and depth-bounds state implemented | Most of the scene is still missing; hardware verification of query/indirect/depth paths, HDR and scaling remain |
-| Shaders | Console GPU code recompiled to DXIL at first use, cached on disk; 32/64-bit integer image atomics and byte/halfword shared-memory operations covered by synthetic validation and WARP execution | Physical-GPU/title execution, merged geometry stages and ray-tracing builder shaders; some compute programs need a GPU with 64-lane waves |
+| GPU: world | Mesh pipelines, shader-written buffers, descriptor lifetimes, bounded indirect execution, worker-created pipelines cached on disk; GPU-ordered constant staging, native queries and depth-bounds state implemented | Most of the scene is still missing; hardware verification of query/indirect/depth paths, HDR and scaling remain |
+| Shaders | Console GPU code recompiled to DXIL at first use, cached on disk; 32/64-bit integer image atomics, byte/halfword shared-memory operations and bounded single-dword LDS accesses covered by synthetic tests | Physical-GPU/title execution, merged geometry stages and ray-tracing builder shaders; some compute programs need a GPU with 64-lane waves |
 | Textures | Console tiled layouts and detiling for the modes the title uses; GPU-ordered buffer/texture copies and linear readback pass authored Windows tests | Title validation of copy behavior; render-target metadata planes |
 | Series S mode | Runs through the menus to the loading screen | The world, as above |
 
 The title results above describe the last reported hardware run, before the
-new atomic, query, indirect-execution, shared-memory and texture-copy changes. That run's offline shader
+new atomic, query, indirect-execution, shared-memory, constant-buffer and copy-ordering changes. That run's offline shader
 census was mesh 8,191/8,506, vertex/pixel 10,617/12,346 and compute 1,643/2,539.
 Those counts have not been remeasured with this branch and do not establish
 which shaders execute in the world. See the

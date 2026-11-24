@@ -21,9 +21,9 @@ static CACHE: OnceLock<Cache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 
-// Version 3 replaces the all-zero HASH part with the program's MD5 digest.
+// Version 4 bounds single-dword LDS reads, writes and atomics before access.
 // The executable fingerprint also invalidates any rebuilt emitter.
-const CACHE_VERSION: u32 = 3;
+const CACHE_VERSION: u32 = 4;
 
 /// Keeps translated shaders in `dir` from now on.
 pub fn use_shader_cache(dir: PathBuf) {
