@@ -75,5 +75,6 @@ jobs:
             ${{ runner.temp }}/victory-checks/**/*.stderr.log
             ${{ runner.temp }}/victory-checks/**/*.native.log
             ${{ runner.temp }}/victory-checks/**/native-shader.json
+            ${{ runner.temp }}/victory-checks/**/native-gpu.json
           if-no-files-found: ignore
           retention-days: 7

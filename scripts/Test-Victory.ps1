@@ -44,7 +44,7 @@ $summary = [ordered]@{
 }
 
 function Invoke-Check {
-    param([string]$Name, [string]$Executable, [string[]]$Arguments, [switch]$MustRunOneTest, [switch]$MustValidateAtomicMatrix, [switch]$OptionalAtomicSemantics, [switch]$MustValidateLdsMatrix, [switch]$MustExecuteLds, [switch]$OptionalDepthBounds, [hashtable]$EnvironmentOverrides = @{})
+    param([string]$Name, [string]$Executable, [string[]]$Arguments, [switch]$MustRunOneTest, [switch]$MustValidateAtomicMatrix, [switch]$OptionalAtomicSemantics, [switch]$MustValidateLdsMatrix, [switch]$MustExecuteLds, [switch]$OptionalDepthBounds, [switch]$MustMatchShaderHash, [hashtable]$EnvironmentOverrides = @{})
     Write-Host "Checking $Name..."
     $checkEnvironment = $environment.Clone()
     foreach ($key in $EnvironmentOverrides.Keys) { $checkEnvironment[$key] = $EnvironmentOverrides[$key] }
@@ -54,7 +54,7 @@ function Invoke-Check {
     $checks.Add($check)
     try {
         Assert-VictoryProcessSucceeded $result $Name
-        if ($MustRunOneTest -or $MustValidateAtomicMatrix -or $OptionalAtomicSemantics -or $MustValidateLdsMatrix -or $MustExecuteLds -or $OptionalDepthBounds) {
+        if ($MustRunOneTest -or $MustValidateAtomicMatrix -or $OptionalAtomicSemantics -or $MustValidateLdsMatrix -or $MustExecuteLds -or $OptionalDepthBounds -or $MustMatchShaderHash) {
             $output = (Get-Content -LiteralPath $result.stdout_log -Raw) + (Get-Content -LiteralPath $result.stderr_log -Raw)
             if ($output -notmatch 'test result: ok\. 1 passed;' -or ($MustRunOneTest -and $output -match '; skipped')) {
                 throw "$Name did not run its required test successfully. See $($result.stdout_log)."
@@ -62,6 +62,7 @@ function Invoke-Check {
             if ($MustValidateAtomicMatrix) { $check['coverage'] = Get-VictoryAtomicValidationCoverage $output }
             if ($MustValidateLdsMatrix) { $check['coverage'] = Get-VictoryLdsValidationCoverage $output }
             if ($MustExecuteLds) { $check['coverage'] = Get-VictoryLdsCoverage $output }
+            if ($MustMatchShaderHash) { $check['coverage'] = Get-VictoryShaderHashCoverage $output }
             if ($OptionalDepthBounds) {
                 $check['coverage'] = Get-VictoryDepthBoundsCoverage $output
                 Write-Host "$Name coverage: $($check.coverage.status); cases=$($check.coverage.cases)."
@@ -101,11 +102,14 @@ try {
         $summary['atomic_phase_trace'] = $true
         Invoke-Check 'dxil-validator' 'cargo' @('test', '--locked', '-p', 'victory-shader', '--all-features', 'emit::tests::constant_color_validates', '--', '--exact', '--nocapture') -MustRunOneTest
         Invoke-Check 'atomic-dxil-validator' 'cargo' @('test', '--locked', '-p', 'victory-shader', '--all-features', 'emit::atomic_tests::image_atomics_translate_in_both_widths_and_return_modes', '--', '--exact', '--nocapture') -MustRunOneTest -MustValidateAtomicMatrix
+        $compiler = Join-Path (Split-Path $validator -Parent) 'dxc.exe'
+        Invoke-Check 'shader-hash-reference' 'cargo' @('test', '--locked', '-p', 'victory-shader', '--all-features', 'emit::container::tests::shader_hash_matches_official_dxc', '--', '--ignored', '--exact', '--nocapture') -MustRunOneTest -MustMatchShaderHash -EnvironmentOverrides @{ VICTORY_DXC = $compiler }
         Invoke-Check 'warp-pipeline' 'cargo' @('test', '--locked', '-p', 'victory-shader', '--all-features', 'emit::tests::stub_pipeline_is_created', '--', '--exact', '--nocapture') -MustRunOneTest
         Invoke-Check 'atomic64-unguarded-semantics' 'cargo' @('test', '--locked', '-p', 'victory-shader', '--all-features', 'emit::atomic_tests::image_atomic64_results_match_integer_semantics', '--', '--exact', '--nocapture') -OptionalAtomicSemantics -EnvironmentOverrides @{ VICTORY_D3D12_DEBUG = '1' }
         Invoke-Check 'atomic64-guarded-semantics' 'cargo' @('test', '--locked', '-p', 'victory-shader', '--all-features', 'emit::atomic_tests::guarded_image_atomic64_results_match_integer_semantics', '--', '--exact', '--nocapture') -OptionalAtomicSemantics -EnvironmentOverrides @{ VICTORY_D3D12_DEBUG = '1' }
         if ($NativeShaderDebug) {
             Invoke-Check 'native-shader-debug' (Get-Process -Id $PID).Path @('-NoProfile', '-NonInteractive', '-File', (Join-Path $PSScriptRoot 'Test-NativeShader.ps1'), '-OutputRoot', $report)
+            Invoke-Check 'native-gpu-debug' (Get-Process -Id $PID).Path @('-NoProfile', '-NonInteractive', '-File', (Join-Path $PSScriptRoot 'Test-NativeGpu.ps1'), '-OutputRoot', $report)
         }
         Invoke-Check 'lds-dxil-validator' 'cargo' @('test', '--locked', '-p', 'victory-shader', '--all-features', 'emit::lds_tests::lds_subword_programs_translate_and_validate', '--', '--exact', '--nocapture') -MustRunOneTest -MustValidateLdsMatrix
         Invoke-Check 'lds-semantics' 'cargo' @('test', '--locked', '-p', 'victory-shader', '--all-features', 'emit::lds_tests::lds_subword_results_preserve_adjacent_bytes', '--', '--exact', '--nocapture') -MustRunOneTest -MustExecuteLds

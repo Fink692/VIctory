@@ -177,6 +177,15 @@ function Get-VictoryLdsValidationCoverage {
     return [ordered]@{ status = 'validated'; containers = 168 }
 }
 
+function Get-VictoryShaderHashCoverage {
+    param([Parameter(Mandatory)][string]$Output)
+    $coverageMatches = [regex]::Matches($Output, '(?m)^VICTORY_SHADER_HASH_RESULT=matched programs=(\d+)\r?$')
+    if ($coverageMatches.Count -ne 1 -or [uint64]$coverageMatches[0].Groups[1].Value -ne 2) {
+        throw 'Shader hashes must match the official compiler for both authored reference programs.'
+    }
+    return [ordered]@{ status = 'matched'; programs = 2 }
+}
+
 function Get-VictoryLdsCoverage {
     param([Parameter(Mandatory)][string]$Output)
     $coverageMatches = [regex]::Matches($Output, '(?m)^VICTORY_LDS_RESULT=executed adapters=(\d+) cases=(\d+)\r?$')

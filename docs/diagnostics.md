@@ -9,7 +9,7 @@ separate so fixes can be compared against the same scenario.
 
 Use Windows x64, the MSVC C++ build tools and Windows SDK, the repository's
 pinned Rust toolchain, and PowerShell 7.2 or newer (`pwsh`). The strict GPU
-test gate also needs the SDK's `x64/dxil.dll` and a WARP adapter able to
+test gate also needs the SDK's `x64/dxil.dll`, sibling `dxc.exe`, and a WARP adapter able to
 create the synthetic shader-model 6.6 pipeline. A missing prerequisite is a
 failure of this gate, rather than a passing skipped GPU test.
 
@@ -45,7 +45,9 @@ after the basic WARP pipeline check. Their separate logs and flushed phase
 markers distinguish validator, pipeline and dispatch failures before the
 parallel workspace suite runs.
 
-The LDS matrix independently validates 168 byte/halfword shared-memory
+The shader-identity check compiles two authored programs with the SDK's DXC
+and compares their `HASH` payloads to our bitcode digest. The LDS matrix
+independently validates 168 byte/halfword shared-memory
 programs and requires 496 semantic dispatch cases per WARP adapter. These
 checks cannot pass through an unsupported-adapter skip. Texture-copy checks
 verify same-submission GPU input, partial readback with guard bytes,
@@ -57,7 +59,9 @@ It saves a `checks.json` report and individual process logs under a unique
 directory in the system temporary folder. `-OutputRoot D:\victory-runs`
 selects another external directory. Omitting `-RequireGpu` permits the
 existing optional GPU tests to skip on machines without their prerequisites;
-that result does not satisfy the strict GPU gate.
+that result does not satisfy the strict GPU gate. Independent checks keep
+running after a failure, and each records its own status and error. The
+final status remains failed if any required check failed.
 
 CI adds `-NativeShaderDebug` to the strict command on `windows-2025` for pull requests and
 pushes to `main`, with read-only repository permissions. It uploads only the
@@ -82,7 +86,10 @@ pwsh -NoProfile -File scripts/Test-Victory.ps1 -RequireGpu -NativeShaderDebug
 `Test-NativeShader.ps1` builds the exact shader test executable and runs it
 three times under x64 CDB with four test threads. Second-chance access
 violations capture the exception, registers, thread stacks and loaded-module
-names. The normal concurrent workspace test still runs afterward. A missing
+names. After any concurrent failure, separate child processes also run the
+exact LDS result test and the seven existing VALU tests, preserving all
+failures and per-case LDS traces. The normal concurrent workspace test
+still runs afterward. A missing
 debugger, timeout, native exception or incomplete Rust result fails the gate.
 CI preserves `.native.log` and `native-shader.json` alongside the other
 synthetic logs; no process memory dumps are written. `-CdbPath`, `-Attempts`
@@ -104,6 +111,17 @@ cargo test --locked -p victory-shader --all-features `
   emit::lds_tests::lds_subword_programs_translate_and_validate `
   -- --exact --nocapture
 Remove-Item Env:VICTORY_DXV
+```
+
+The independent shader-hash comparison is explicitly ignored by ordinary
+test discovery and can be required with an official compiler:
+
+```powershell
+$env:VICTORY_DXC = 'D:\tools\dxc\bin\x64\dxc.exe'
+cargo test --locked -p victory-shader --all-features `
+  emit::container::tests::shader_hash_matches_official_dxc `
+  -- --ignored --exact --nocapture
+Remove-Item Env:VICTORY_DXC
 ```
 
 On Linux, set `VICTORY_DXV` to the absolute path of the Linux `dxv` binary

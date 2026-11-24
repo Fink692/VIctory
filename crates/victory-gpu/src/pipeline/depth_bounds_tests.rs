@@ -130,6 +130,27 @@ fn texture(
     resource.unwrap()
 }
 
+fn read_samples(readback: &ID3D12Resource, count: usize) -> Vec<u64> {
+    let mut mapped = std::ptr::null_mut();
+    // SAFETY: the caller waited for the submission; the readback contains
+    // at least count query results and remains mapped while copied.
+    unsafe {
+        readback
+            .Map(
+                0,
+                Some(&D3D12_RANGE {
+                    Begin: 0,
+                    End: count * 8,
+                }),
+                Some(&mut mapped),
+            )
+            .unwrap();
+        let samples = std::slice::from_raw_parts(mapped.cast::<u64>(), count).to_vec();
+        readback.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+        samples
+    }
+}
+
 /// Keep title objects alive until every native command referring to their
 /// list has completed, including when an assertion unwinds the test.
 struct TitleList {
@@ -365,23 +386,109 @@ fn depth_bounds_filter_stored_depth_and_reset() {
     }
     list.close();
     host.execute(&[list]);
-    let mut mapped = std::ptr::null_mut();
-    // SAFETY: both submissions completed; Map exposes the full readback.
-    let samples = unsafe {
-        readback
-            .Map(
-                0,
-                Some(&D3D12_RANGE {
-                    Begin: 0,
-                    End: count as usize * 8,
-                }),
-                Some(&mut mapped),
-            )
-            .unwrap();
-        let samples = std::slice::from_raw_parts(mapped.cast::<u64>(), count as usize).to_vec();
-        readback.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
-        samples
-    };
+    let samples = read_samples(&readback, count as usize);
+    if std::env::var("VICTORY_DEPTH_BOUNDS_TRACE").is_ok_and(|v| v == "1") {
+        for (index, &(enabled, range, stored, expected)) in cases.iter().enumerate() {
+            eprintln!(
+                "VICTORY_DEPTH_BOUNDS_CASE index={index} enabled={enabled} range={range:?} stored={stored} expected={expected} actual={}",
+                samples[index]
+            );
+        }
+        eprintln!(
+            "VICTORY_DEPTH_BOUNDS_CASE index={} reset=true expected=1 actual={}",
+            count - 1,
+            samples[count as usize - 1]
+        );
+        let failed = cases
+            .iter()
+            .enumerate()
+            .any(|(index, case)| samples[index] != case.3)
+            || samples[count as usize - 1] != 1;
+        if failed {
+            use windows::core::Interface;
+            let native = list.list.cast::<ID3D12GraphicsCommandList1>().unwrap();
+            // These failure diagnostics retain the original assertions.
+            // Compare the title route with a direct native call, then
+            // test whether PSO binding/clearing loses the dynamic state.
+            // ALWAYS with writes disabled has the same passing depth
+            // comparison as DepthEnable=false. LESS/GREATER controls
+            // check that the stored depth and DSV actually participate.
+            let controls: Vec<ID3D12PipelineState> = [
+                (true, D3D12_COMPARISON_FUNC_ALWAYS),
+                (false, D3D12_COMPARISON_FUNC_LESS),
+                (false, D3D12_COMPARISON_FUNC_GREATER),
+            ]
+            .into_iter()
+            .map(|(bounds, comparison)| {
+                g.depth.DepthEnable = true.into();
+                g.depth.DepthFunc = comparison;
+                g.depth_bounds = bounds;
+                let name = super::super::library::name(
+                    "graphics",
+                    &root_blob,
+                    &[&code_bytes(&bytecode(&vs)), &code_bytes(&bytecode(&ps))],
+                    &g.describe(),
+                );
+                graphics_pipeline(&host.device, &root, bytecode(&vs), bytecode(&ps), &g, &name)
+                    .unwrap()
+            })
+            .collect();
+            let probes = [
+                ("title-before-state", false, false, &pipelines[1], 0),
+                ("native-before-state", true, false, &pipelines[1], 0),
+                ("title-after-state", false, true, &pipelines[1], 0),
+                ("native-after-state", true, true, &pipelines[1], 0),
+                ("native-depth-always", true, true, &controls[0], 0),
+                ("native-depth-less", true, true, &controls[1], 0),
+                ("native-depth-greater", true, true, &controls[2], 1),
+            ];
+            for (label, direct, after_state, pipeline, expected) in probes {
+                title.reset();
+                bind();
+                let set = || {
+                    if direct {
+                        // SAFETY: a fresh open list with advertised support.
+                        unsafe { native.OMSetDepthBounds(0.75, 1.0) };
+                    } else {
+                        title.set_bounds(0.75, 1.0);
+                    }
+                };
+                if !after_state {
+                    set();
+                }
+                // SAFETY: the PSO and DSV remain live for the submission.
+                unsafe {
+                    list.list.SetPipelineState(pipeline);
+                    list.list
+                        .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.5, 0, None);
+                }
+                if after_state {
+                    set();
+                }
+                // SAFETY: reuse only the first query after prior work has
+                // completed; the original results are already copied.
+                unsafe {
+                    list.list.BeginQuery(&query, D3D12_QUERY_TYPE_OCCLUSION, 0);
+                    list.list.DrawInstanced(3, 1, 0, 0);
+                    list.list.EndQuery(&query, D3D12_QUERY_TYPE_OCCLUSION, 0);
+                    list.list.ResolveQueryData(
+                        &query,
+                        D3D12_QUERY_TYPE_OCCLUSION,
+                        0,
+                        1,
+                        &readback,
+                        0,
+                    );
+                }
+                list.close();
+                host.execute(&[list]);
+                let actual = read_samples(&readback, 1)[0];
+                eprintln!(
+                    "VICTORY_DEPTH_BOUNDS_PROBE label={label} range=[0.75,1] stored=0.5 expected={expected} actual={actual}"
+                );
+            }
+        }
+    }
     for (index, &(_, range, stored, expected)) in cases.iter().enumerate() {
         assert_eq!(
             samples[index], expected,

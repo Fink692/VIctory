@@ -3,6 +3,28 @@
 use super::*;
 use crate::list::CopyLocation;
 
+fn test_host() -> &'static crate::host::Host {
+    // lib tests have no tracing subscriber. Preserve the fatal failure,
+    // but make its D3D12 validation message visible before aborting.
+    crate::host::on_failure(|message| {
+        use std::io::Write;
+        let mut stderr = std::io::stderr().lock();
+        let _ = writeln!(stderr, "VICTORY_COPY_FAILURE {message}");
+        let _ = stderr.flush();
+        std::process::abort();
+    });
+    crate::host::host().expect("a D3D12 adapter is required")
+}
+
+fn trace(args: std::fmt::Arguments<'_>) {
+    if std::env::var("VICTORY_COPY_TRACE").is_ok_and(|v| v == "1") {
+        use std::io::Write;
+        let mut stderr = std::io::stderr().lock();
+        writeln!(stderr, "VICTORY_COPY_TRACE {args}").unwrap();
+        stderr.flush().unwrap();
+    }
+}
+
 struct Owned(This);
 
 impl Drop for Owned {
@@ -115,7 +137,7 @@ fn image(resource: &Owned, subresource: u32) -> CopyLocation {
 #[test]
 #[ignore = "requires D3D12; run with VICTORY_D3D12_WARP=1"]
 fn gpu_texture_copies_preserve_order_and_guards() {
-    let host = crate::host::host().expect("a D3D12 adapter is required");
+    let host = test_host();
     let input = make(4096, 1, 0, 1);
     let working = make(4096, 1, 0, 1);
     let output = make(4096, 1, 0, 1);
@@ -188,7 +210,7 @@ fn gpu_texture_copies_preserve_order_and_guards() {
 #[test]
 #[ignore = "requires D3D12; run with VICTORY_D3D12_WARP=1"]
 fn texture_readback_crosses_lists_and_reuses_subresources() {
-    let host = crate::host::host().expect("a D3D12 adapter is required");
+    let host = test_host();
     let source = make(4096, 1, 0, 1);
     let output = make(4096, 1, 0, 1);
     let texture = make(4, 4, 28, 2);
@@ -252,7 +274,7 @@ fn texture_readback_crosses_lists_and_reuses_subresources() {
 #[test]
 #[ignore = "requires D3D12; run with VICTORY_D3D12_WARP=1"]
 fn invalid_texture_copy_ranges_leave_destination_unchanged() {
-    let host = crate::host::host().expect("a D3D12 adapter is required");
+    let host = test_host();
     let buffer = make(256, 1, 0, 1);
     let texture = make(4, 4, 28, 1);
     bytes(&buffer, 0x5e);
@@ -308,7 +330,10 @@ fn invalid_texture_copy_ranges_leave_destination_unchanged() {
 #[test]
 #[ignore = "requires D3D12; run with VICTORY_D3D12_WARP=1"]
 fn block_compressed_small_mips_round_trip() {
-    let host = crate::host::host().expect("a D3D12 adapter is required");
+    trace(format_args!("phase=device_begin"));
+    let host = test_host();
+    trace(format_args!("phase=device_end"));
+    trace(format_args!("phase=resources_begin"));
     let input = make(512, 1, 0, 1);
     let output = make(512, 1, 0, 1);
     let texture = make(4, 4, 71, 3);
@@ -316,6 +341,21 @@ fn block_compressed_small_mips_round_trip() {
     bytes(&output, 0xa3);
     let block = |mip: usize| [mip as u8 + 1, 17, 39, 53, 71, 91, 113, 137];
     let list = host.new_list().unwrap();
+    if let Some(error) = host.log_messages() {
+        panic!("BC resource creation validation failed: {error}");
+    }
+    trace(format_args!("phase=resources_end"));
+    let copy = |label: &str, dst: CopyLocation, src: CopyLocation, region| {
+        trace(format_args!(
+            "phase=copy_begin case={label:?} src_kind={} src={:?} dst_kind={} dst={:?} box={region:?}",
+            src.kind, src.footprint, dst.kind, dst.footprint
+        ));
+        crate::texture_copy::record(&list, &dst, [0; 3], &src, region).unwrap();
+        if let Some(error) = host.log_messages() {
+            panic!("{label}: D3D12 validation failed: {error}");
+        }
+        trace(format_args!("phase=copy_end case={label:?}"));
+    };
     for mip in 0..3 {
         let offset = 7 + mip * 64;
         // SAFETY: this eight-byte authored BC1 block fits the input buffer.
@@ -327,55 +367,45 @@ fn block_compressed_small_mips_round_trip() {
         } else {
             (4, None)
         };
-        crate::texture_copy::record(
-            &list,
-            &image(&texture, mip as u32),
-            [0; 3],
-            &placed_format(&input, offset as u64, 71, size, size, 12),
+        copy(
+            &format!("upload-mip-{mip}"),
+            image(&texture, mip as u32),
+            placed_format(&input, offset as u64, 71, size, size, 12),
             region,
-        )
-        .unwrap();
+        );
     }
     // Observe the logical-sized buffer upload before overwriting mip 2.
-    crate::texture_copy::record(
-        &list,
-        &placed_format(&output, 267, 71, 4, 4, 12),
-        [0; 3],
-        &image(&texture, 2),
+    copy(
+        "read-logical-upload",
+        placed_format(&output, 267, 71, 4, 4, 12),
+        image(&texture, 2),
         None,
-    )
-    .unwrap();
+    );
     // This exercises the same-resource staging footprint for a small mip.
-    crate::texture_copy::record(
-        &list,
-        &image(&texture, 2),
-        [0; 3],
-        &image(&texture, 1),
+    copy(
+        "copy-mip-1-to-2",
+        image(&texture, 2),
+        image(&texture, 1),
         Some([0, 0, 0, 2, 2, 1]),
-    )
-    .unwrap();
+    );
     let mut expected = vec![0xa3; 512];
     expected[267..275].copy_from_slice(&block(2));
     for mip in 0..3 {
         let offset = 11 + mip * 64;
-        crate::texture_copy::record(
-            &list,
-            &placed_format(&output, offset as u64, 71, 4, 4, 12),
-            [0; 3],
-            &image(&texture, mip as u32),
+        copy(
+            &format!("readback-mip-{mip}"),
+            placed_format(&output, offset as u64, 71, 4, 4, 12),
+            image(&texture, mip as u32),
             None,
-        )
-        .unwrap();
+        );
         expected[offset..offset + 8].copy_from_slice(&block(if mip == 2 { 1 } else { mip }));
     }
-    crate::texture_copy::record(
-        &list,
-        &placed_format(&output, 203, 71, 4, 4, 12),
-        [0; 3],
-        &image(&texture, 2),
+    copy(
+        "read-logical-edge",
+        placed_format(&output, 203, 71, 4, 4, 12),
+        image(&texture, 2),
         Some([0, 0, 0, 1, 1, 1]),
-    )
-    .unwrap();
+    );
     expected[203..211].copy_from_slice(&block(1));
     assert!(
         crate::texture_copy::record(
@@ -388,9 +418,14 @@ fn block_compressed_small_mips_round_trip() {
         .is_err(),
         "an incomplete block edge that is not the logical mip edge is invalid"
     );
+    trace(format_args!("phase=close_begin"));
     list.close();
+    trace(format_args!("phase=close_end"));
+    trace(format_args!("phase=execute_begin"));
     host.execute(&[&list]);
+    trace(format_args!("phase=execute_end"));
     assert_eq!(read(&output), expected);
+    trace(format_args!("phase=results_match"));
 }
 
 /// The two D24S8 subresources have different native footprint formats:
@@ -399,7 +434,7 @@ fn block_compressed_small_mips_round_trip() {
 #[test]
 #[ignore = "requires D3D12; run with VICTORY_D3D12_WARP=1"]
 fn depth_stencil_copies_use_selected_plane_formats() {
-    let host = crate::host::host().expect("a D3D12 adapter is required");
+    let host = test_host();
     let input = make(512, 1, 0, 1);
     let output = make(512, 1, 0, 1);
     let texture = make(2, 2, 45, 1);
