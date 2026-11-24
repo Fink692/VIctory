@@ -274,7 +274,16 @@
         },
         "throughput_ratio": 1.424954379562044
       }
-    ]
+    ],
+    "input_equivalence": {
+      "verified": true,
+      "method": "Equal encoded stream byte counts and FNV64 hashes, outside timed runs",
+      "streams": [
+        "INPUT BC1 bytes=163924 fnv64=d6c8aca21bbfcf2d",
+        "INPUT BC4 bytes=163924 fnv64=373415d009045826",
+        "INPUT BC7 bytes=450711 fnv64=72878ded54060686"
+      ]
+    }
   },
   "texture": {
     "baseline": "03da5ec62ae2333aade54388ba72a4d808a5f6d9",
@@ -701,5 +710,59 @@
         "all_hashes_match": true
       }
     ]
+  },
+  "shader_test_only_regressions": [
+    {
+      "test": "emit::depth_tests::conservative_depth_uses_centroid_position",
+      "baseline": "fails: SV_DepthLessEqual position interpolation is 4, expected 5",
+      "adapted_portable": "passes all three output modes; emitted containers validated with Linux DXV",
+      "scope": "Authored shaders; hosted Windows validator gate supplies native acceptance."
+    },
+    {
+      "test": "emit::buffer_tests::packed_buffer_formats_translate_and_validate",
+      "baseline": "fails: Unsupported at offset 64, a buffer format",
+      "adapted_portable": "passes authored packed-format translation and Linux DXV validation",
+      "scope": "Twenty new packed numeric formats and three existing multi-dword formats; hosted Windows result gate checks 126 cases per backend, including 36 structured cases."
+    }
+  ],
+  "native_acceptance": {
+    "pull_request": "https://github.com/Fink692/VIctory/pull/4",
+    "command": "scripts/Test-Victory.ps1 -RequireGpu -NativeShaderDebug",
+    "required_checks": 40,
+    "result_location": "The tested pull request head and retained GitHub Actions report artifacts; no native result is inferred from cross-compilation.",
+    "new_required_coverage": {
+      "waterfall": {
+        "programs": 6,
+        "lanes_per_execution": 32
+      },
+      "sample_offsets": {
+        "offsets_per_backend": 5,
+        "pixels_per_offset": 16
+      },
+      "descriptor_exhaustion": {
+        "cases": 3,
+        "validation_errors": 0
+      },
+      "depth_exports": {
+        "independently_validated_containers": 3
+      },
+      "packed_buffers": {
+        "formats": 23,
+        "new_packed_formats": 20,
+        "cases_per_backend": 126,
+        "structured_cases_per_backend": 36
+      },
+      "mixed_buffer_access": {
+        "programs": 20,
+        "cases_per_execution": 13
+      },
+      "buffer_views": {
+        "cases": 26,
+        "structured_cases": 21,
+        "raw_cases": 3,
+        "typed_cases": 2,
+        "validation_errors": 0
+      }
+    }
   }
 }

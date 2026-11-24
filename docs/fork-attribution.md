@@ -19,15 +19,20 @@ local account names when those are what the commits record.
 ## Shared source commit
 
 The following broad commit supplied several selected changes. Its one row covers
-the runtime, scheduler and format adaptations together.
+the runtime, scheduler, format and buffer-addressing adaptations together.
 
 | Source commit | Original author | Original title | Scope adopted here |
 | --- | --- | --- | --- |
-| [578d459](https://github.com/fxceless/victory-fork/commit/578d459c344aa44753e9a61ea6ba10a8c68f6ea6) | fxceless; co-author Claude Fable 5.2 | victory-gta6: this fork's changes on top of VIctory main (ffe310e) | Release the original and prepared executable buffers after mapping; adapt the shared pipeline wait reservation and priority queue; adopt selected BCPack dictionary layout and texture copy loop changes. |
+| [578d459](https://github.com/fxceless/victory-fork/commit/578d459c344aa44753e9a61ea6ba10a8c68f6ea6) | fxceless; co-author Claude Fable 5.2 | victory-gta6: this fork's changes on top of VIctory main (ffe310e) | Release the original and prepared executable buffers after mapping; adapt the shared pipeline wait reservation and priority queue; adopt selected BCPack dictionary layout and texture copy loop changes; use its mixed buffer-access diagnosis to develop compatible structured-coordinate lowering. |
 
 The scope above excludes the console instruction emulator and the broad commit's
 other experimental rendering systems. The source link identifies provenance
 for the listed changes, rather than a complete merge of that commit.
+
+The mixed byte-addressed/indexed vector buffer diagnosis informed a local adaptation:
+retain native structured descriptors and lower vector byte accesses to structured
+record/member coordinates. The fork's blanket structured-to-raw descriptor
+conversion is not copied; it would impose additional alignment and size limits.
 
 ## Runtime, configuration and loader
 
@@ -81,6 +86,8 @@ for the listed changes, rather than a complete merge of that commit.
 | [6c63dea](https://github.com/fxceless/victory-fork/commit/6c63deaa89a28286b1248ed9cdd9f49bf49e32e8) | r4. | Shaders: name why a loop is no waterfall, and test the shapes found in review | Keep rejection diagnostics and authored regression shapes for invalid waterfall loops. |
 | [74a9d33](https://github.com/fxceless/victory-fork/commit/74a9d3316de69b65eb64b2fa5c06089d8979ed6f) | r4. | Shader tests: the waterfall tests take the GPU one at a time, with the VALU tests | Serialize waterfall GPU fixtures with the native VALU fixtures. |
 | [ffe310e](https://github.com/fxceless/victory-fork/commit/ffe310eb2098e52169f4c44db5ffdabf43a72622) | Marvis | Shaders: the console's waterfall loop over a first-lane table offset | Handle the compiler form that loads a descriptor at a first-lane table offset. |
+| [c249f02](https://github.com/fxceless/victory-fork/commit/c249f02dd5d933537195c668d8082d82a9e50efa) | Saitken91; co-author Claude Opus 5.5 | Shaders: centroid position with conservative depth | Declare centroid position interpolation for conservative depth outputs; add authored checks for both conservative semantics and ordinary depth. |
+| [9fe73ba](https://github.com/fxceless/victory-fork/commit/9fe73ba9774cc6d81d221fe74aaf870b68cfe43c) | artor410; co-author Claude Opus 5.5 | shader: decode the packed typed-buffer formats | Decode the three packed format families and unsigned 10/11-bit floats; add authored instruction fixtures and independent channel-value expectations. |
 
 ## GPU behavior and cache publication
 
@@ -94,6 +101,9 @@ for the listed changes, rather than a complete merge of that commit.
 | [63df363](https://github.com/fxceless/victory-fork/commit/63df36315956f1fef1dd7068a336ce5177b0baa3) | Duff | GPU: a half-float rounding carry raises the exponent, not halves the value | Carry half-float mantissa rounding into the exponent in the CPU oracle and GPU expansion. |
 | [eb30a0d](https://github.com/fxceless/victory-fork/commit/eb30a0d9f4f8aee0a287563406adc9de06377cfb) | Enzo Souza Duarte | GPU: write half subnormals from f32 rectangle outputs | Support half-float subnormal rectangle outputs; adapt rounding to nearest-even. |
 | [3c81420](https://github.com/fxceless/victory-fork/commit/3c814208f1160a1c70f02b13617d652927fbda88) | hophaver; co-author Claude Opus 5.5 | GPU: drop draws whose fresh tables cannot be made; 2^18 dynamic slots | Drop work when descriptor tables cannot be allocated; retain this tree's pool size and lifetime model. |
+| [a4e7f1d](https://github.com/fxceless/victory-fork/commit/a4e7f1d004bff927c205981c623142c8e7dbb4a4) | FIocker | GPU: replay pending descriptors before publishing the host heap | Replay queued descriptor writes before publishing the initialized host heap to other recording threads. |
+| [ec0d155](https://github.com/fxceless/victory-fork/commit/ec0d15592530c535bdb049aeb5831fe7b1ef80d0) | Manuel Pérez; co-author Claude Opus 5.5 | Watch: saturate the end of announced writes and remaps | Saturate write and remap range endpoints at the end of the address space; retain the overflow regression. |
+| [b304b7d](https://github.com/fxceless/victory-fork/commit/b304b7ddbfb916c1e822bd2dc3ad4fc9ae696af9) | Jeremy Goldberg | fix(gpu): average copy statistics over the full reporting interval | Count frames across the full copy-statistics reporting interval instead of only the latest caption interval. |
 
 ## Format decoding and documentation
 
@@ -122,6 +132,14 @@ around the selected changes:
   DXIL-compatible atomic subtraction and shader cache versioning. Authored
   native instruction and waterfall fixtures are connected to strict coverage
   checks and the pinned WARP validation workflow.
+- Sample-offset execution uses an authored fullscreen triangle so the pixel
+  assertions exercise rasterization. Packed-format fixtures check independent
+  channel expectations, including float boundaries and signed values; depth
+  fixtures inspect interpolation metadata and validate emitted containers.
+- Mixed buffer fixtures compare byte and indexed accesses through the same
+  descriptor, including stores and atomics. Native view fixtures retain valid
+  structured alignments, raw controls and typed component mappings; checked
+  arithmetic preserves large indexed ranges without a raw-byte-length limit.
 - BCPack adaptations are checked against the existing decoding behavior, and the
   authored texture-copy fixtures cover layout and padding behavior.
 - Runtime regression fixtures are used against the original implementation and

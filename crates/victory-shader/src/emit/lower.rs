@@ -21,12 +21,40 @@ use crate::resource::{Address, CODE, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 type Why = &'static str;
+type HandleKey = (usize, Site, u8, bool, (u32, u32));
 
 #[derive(Debug, Clone, Copy)]
 enum Val {
     I32(V),
     Bit(V),
     Missing(Why),
+}
+
+/// Keep indexed and byte addressing distinct until each component's bounds
+/// have been checked. The scalar offset moves the descriptor base.
+struct BufferAddress {
+    element: Option<V>,
+    member: V,
+    scalar: V,
+    valid: V,
+    stride: u32,
+}
+
+struct StructuredBufferAddress {
+    element: Option<V>,
+    member: V,
+    base_records: V,
+    base_member: V,
+    valid: V,
+    stride: V,
+    records: V,
+}
+
+#[derive(Clone, Copy)]
+enum BufferOp {
+    Load(u32),
+    Store(u32),
+    Atomic(u32),
 }
 
 pub(crate) struct Lowered {
@@ -107,31 +135,44 @@ fn buffer_format(format: u8) -> Option<(&'static [u32], Numeric)> {
     const NORM: &[Numeric] = &[Unorm, Snorm, Uscaled, Sscaled, Uint, Sint];
     const ALL: &[Numeric] = &[Unorm, Snorm, Uscaled, Sscaled, Uint, Sint, Float];
     const WIDE: &[Numeric] = &[Uint, Sint, Float];
-    // `None`: a family not decoded (packed floats, 10_10_10_2).
-    const FAMILIES: [(Option<&[u32]>, &[Numeric]); 14] = [
-        (Some(&[8]), NORM),
-        (Some(&[16]), ALL),
-        (Some(&[8, 8]), NORM),
-        (Some(&[32]), WIDE),
-        (Some(&[16, 16]), ALL),
-        (None, ALL),                    // 10_11_11
-        (None, ALL),                    // 11_11_10
-        (None, NORM),                   // 10_10_10_2
-        (Some(&[10, 10, 10, 2]), NORM), // 2_10_10_10
-        (Some(&[8, 8, 8, 8]), NORM),
-        (Some(&[32, 32]), WIDE),
-        (Some(&[16, 16, 16, 16]), ALL),
-        (Some(&[32, 32, 32]), WIDE),
-        (Some(&[32, 32, 32, 32]), WIDE),
+    // Numbers and order from LLVM's `UfmtGFX10` (`SIDefines.h`); the GFX10
+    // buffer formats have no 5_9_9_9. Channel order from Mesa
+    // (`ac_formats.c`): R11G11B10_FLOAT is 10_11_11, and 10_10_10_2 has
+    // its 2-bit channel in the lowest bits.
+    const FAMILIES: [(&[u32], &[Numeric]); 14] = [
+        (&[8], NORM),
+        (&[16], ALL),
+        (&[8, 8], NORM),
+        (&[32], WIDE),
+        (&[16, 16], ALL),
+        (&[11, 11, 10], ALL),     // 10_11_11
+        (&[10, 11, 11], ALL),     // 11_11_10
+        (&[2, 10, 10, 10], NORM), // 10_10_10_2
+        (&[10, 10, 10, 2], NORM), // 2_10_10_10
+        (&[8, 8, 8, 8], NORM),
+        (&[32, 32], WIDE),
+        (&[16, 16, 16, 16], ALL),
+        (&[32, 32, 32], WIDE),
+        (&[32, 32, 32, 32], WIDE),
     ];
     let mut n = usize::from(format.checked_sub(1)?);
     for (bits, numerics) in FAMILIES {
         if n < numerics.len() {
-            return Some((bits?, numerics[n]));
+            return Some((bits, numerics[n]));
         }
         n -= numerics.len();
     }
     None
+}
+
+/// How far a float channel of `width` bits (16, or the unsigned 11- and
+/// 10-bit floats of the packed formats) shifts up to be a half:
+/// the small floats are a half's exponent (5 bits, biased 15) and the top
+/// of its mantissa, without the sign, so `legacyF16ToF32` widens them
+/// exactly, denormals, infinities and NaNs included.
+fn half_shift(width: u32) -> u32 {
+    debug_assert!(matches!(width, 10 | 11 | 16), "{width}-bit float");
+    if width == 16 { 0 } else { 15 - width }
 }
 
 struct Lower<'a> {
@@ -160,7 +201,7 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
+    handles: HashMap<HandleKey, V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -3158,13 +3199,12 @@ impl<'a> Lower<'a> {
                 };
                 ((kind | u, 0x409), Some(kind))
             }
-            Fields::Buffer { idxen, format, .. } => {
-                let stride = used.map_or(0, |u| u.stride);
+            Fields::Buffer { .. } => {
                 let props = if un.starts_with("buffer_load_format")
                     || un.starts_with("buffer_store_format")
                 {
                     (10 | u, 0x409)
-                } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
+                } else if let Some(stride) = self.heap_buffer_stride(&src) {
                     (12 | u, stride)
                 } else {
                     (11 | u, 0)
@@ -3306,17 +3346,54 @@ impl<'a> Lower<'a> {
     /// typed loads do (channels past the format's read 0, 0, 0, 1).
     // shortcut: the descriptor's channel swizzle is taken as the identity
     // (it is for raw views and the descriptors code builds), elements of 4
-    // bytes or more as dword-aligned, and the packed float and 10_10_10_2
-    // layouts are refused; decode them when a program needs them. Norm
-    // formats divide, which the AMD driver does 1 ULP off the hardware's
-    // correctly rounded conversion for some values; correct it with an
-    // integer check if a title compares converted values exactly.
-    fn format_load(&mut self, h: V, off: V, format: u8, channels: u32) -> Result<Vec<V>, Why> {
+    // bytes or more as dword-aligned. Norm formats divide, which the AMD
+    // driver does 1 ULP off the hardware's correctly rounded conversion for
+    // some values; correct it with an integer check if a title compares
+    // converted values exactly.
+    fn format_load(
+        &mut self,
+        h: V,
+        off: V,
+        format: u8,
+        channels: u32,
+        structured: Option<&StructuredBufferAddress>,
+        guard: Option<V>,
+    ) -> Result<Vec<V>, Why> {
         let (bits, numeric) = buffer_format(format).ok_or("a buffer format")?;
-        let c = self.cur;
         let total: u32 = bits.iter().sum();
         let (u, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+        // MTBUF payloads are checked all-or-nothing. A formatted element
+        // can span structured records, but a final dword outside the view
+        // zeros the entire element (the format's missing channels still
+        // expand to 0,0,0,1 below).
+        let complete = structured.map(|address| {
+            self.structured_component(address, total.div_ceil(32) - 1, guard)
+                .2
+        });
         let load = |l: &mut Self, at: V, n: u32| -> Vec<V> {
+            if let Some(address) = structured {
+                return (0..n)
+                    .map(|k| {
+                        let (element, member, enabled) =
+                            l.structured_component(address, k, complete);
+                        let branch = l.begin_guarded(Some(enabled));
+                        let one = l.s.m.i8(1);
+                        let r = l.s.op(
+                            l.cur,
+                            "rawBufferLoad.f32",
+                            Attr::ReadOnly,
+                            l.s.t.res_ret,
+                            139,
+                            &[h, element, member, one, align],
+                        );
+                        let r = l.s.m.extract(l.cur, r, 0);
+                        let r = l.as_int(r);
+                        let zero = l.s.m.i32(0);
+                        l.end_guarded(branch, &[(r, zero)])[0]
+                    })
+                    .collect();
+            }
+            let c = l.cur;
             let mask = l.s.m.i8((1u8 << n) - 1);
             let r = l.s.op(
                 c,
@@ -3336,14 +3413,16 @@ impl<'a> Lower<'a> {
         let words = if total < 32 {
             // A byte or half inside the dword that holds it.
             let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
-            let at = self.s.m.bin(c, Bin::And, off, not3);
+            let at = self.s.m.bin(self.cur, Bin::And, off, not3);
             let w = load(self, at, 1)[0];
+            let c = self.cur;
             let byte = self.s.m.bin(c, Bin::And, off, three);
             let sh = self.s.m.bin(c, Bin::Shl, byte, three);
             vec![self.s.m.bin(c, Bin::LShr, w, sh)]
         } else {
             load(self, off, total / 32)
         };
+        let c = self.cur;
         let float = |l: &mut Self, f: V| l.as_int(f);
         let mut out = Vec::new();
         let mut at = 0;
@@ -3397,9 +3476,16 @@ impl<'a> Lower<'a> {
                 Numeric::Sint => signed(self),
                 Numeric::Float if w == 32 => field,
                 Numeric::Float => {
+                    let h = match half_shift(w) {
+                        0 => field,
+                        k => {
+                            let sh = self.s.m.i32(k);
+                            self.s.m.bin(c, Bin::Shl, field, sh)
+                        }
+                    };
                     let f = self
                         .s
-                        .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[field]);
+                        .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
                     float(self, f)
                 }
             };
@@ -3469,6 +3555,18 @@ impl<'a> Lower<'a> {
                     && u.table_offset_dwords <= dword
             })
             .max_by_key(|u| u.table_offset_dwords)
+    }
+
+    /// The known stride of a structured heap view. Both byte-addressed and
+    /// indexed instructions must use its structured host descriptor kind.
+    /// Root descriptors have no view extent and retain their existing path.
+    fn heap_buffer_stride(&self, src: &Source) -> Option<u32> {
+        let u = self.used_kind(src)?;
+        (u.root == RootType::Table
+            && u.kind != ResourceType::Cbv
+            && u.stride >= 4
+            && u.stride.is_multiple_of(4))
+        .then_some(u.stride)
     }
 
     /// A handle for the descriptor `src` read at `site`.
@@ -6380,6 +6478,201 @@ impl<'a> Lower<'a> {
         })
     }
 
+    /// Adds an address component, retaining a no-overflow predicate.
+    fn buffer_offset_add(&mut self, a: V, b: V, valid: &mut Option<V>) -> V {
+        let c = self.cur;
+        let sum = self.s.m.bin(c, Bin::Add, a, b);
+        if let Some(previous) = *valid {
+            let fits = self.s.m.cmp(c, pred::IUGE, sum, a);
+            *valid = Some(self.s.m.bin(c, Bin::And, previous, fits));
+        }
+        sum
+    }
+
+    fn structured_address(&mut self, handle: V, address: BufferAddress) -> StructuredBufferAddress {
+        let BufferAddress {
+            element,
+            member,
+            scalar,
+            valid,
+            stride,
+        } = address;
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let iu = self.s.m.undef(i32t);
+        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+        let d = self
+            .s
+            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[handle, iu]);
+        let records = self.s.m.extract(c, d, 0);
+        let stride = self.s.m.i32(stride);
+        let base_records = self.s.m.bin(c, Bin::UDiv, scalar, stride);
+        let base_member = self.s.m.bin(c, Bin::URem, scalar, stride);
+        StructuredBufferAddress {
+            element,
+            member,
+            base_records,
+            base_member,
+            valid,
+            stride,
+            records,
+        }
+    }
+
+    /// Structured coordinates for one dword. Preserve the element index
+    /// directly: multiplying it into a 32-bit byte offset would lose valid
+    /// addresses above 4 GiB. Divide byte offsets by the known stride and
+    /// carry their record part into the index instead.
+    ///
+    /// An indexed access checks each member against the record stride;
+    /// a byte-addressed access can span records. The scalar offset moves
+    /// the base and is not part of the indexed member check. See AMD RDNA2
+    /// ISA 8.1.2/Table 35 (structured OOB_SELECT=0), 8.1.7 (dword alignment):
+    /// <https://docs.amd.com/api/khub/documents/Et~wpu9g~Ffl7d9q0QZ~Og/content>.
+    fn structured_component(
+        &mut self,
+        a: &StructuredBufferAddress,
+        component: u32,
+        guard: Option<V>,
+    ) -> (V, V, V) {
+        let c = self.cur;
+        let delta = self.s.m.i32(4 * component);
+        let mut valid = Some(a.valid);
+        let member = self.buffer_offset_add(a.member, delta, &mut valid);
+        let (element, member) = match a.element {
+            Some(element) => {
+                let in_records = self.s.m.cmp(c, pred::IULT, element, a.records);
+                let in_member = self.s.m.cmp(c, pred::IULT, member, a.stride);
+                let ok = self.s.m.bin(c, Bin::And, in_records, in_member);
+                valid = Some(self.s.m.bin(c, Bin::And, valid.unwrap(), ok));
+                (element, member)
+            }
+            None => (
+                self.s.m.bin(c, Bin::UDiv, member, a.stride),
+                self.s.m.bin(c, Bin::URem, member, a.stride),
+            ),
+        };
+        let member = self.buffer_offset_add(member, a.base_member, &mut valid);
+        let carry = self.s.m.bin(c, Bin::UDiv, member, a.stride);
+        let member = self.s.m.bin(c, Bin::URem, member, a.stride);
+        let element = self.buffer_offset_add(element, a.base_records, &mut valid);
+        let element = self.buffer_offset_add(element, carry, &mut valid);
+        let in_view = self.s.m.cmp(c, pred::IULT, element, a.records);
+        let valid = self.s.m.bin(c, Bin::And, valid.unwrap(), in_view);
+        let enabled = match guard {
+            Some(g) => self.s.m.bin(c, Bin::And, g, valid),
+            None => valid,
+        };
+        let aligned = self.s.m.i32(!3);
+        let member = self.s.m.bin(c, Bin::And, member, aligned);
+        (element, member, enabled)
+    }
+
+    /// Dword loads, stores and atomics share the descriptor's structured
+    /// kind, regardless of the console instruction's addressing form.
+    fn structured_buffer(
+        &mut self,
+        inst: &Inst,
+        handle: V,
+        address: StructuredBufferAddress,
+        op: BufferOp,
+        guard: Option<V>,
+    ) -> Result<(), Why> {
+        let i32t = self.s.t.i32;
+        let iu = self.s.m.undef(i32t);
+        let count = match op {
+            BufferOp::Load(n) | BufferOp::Store(n) => n,
+            BufferOp::Atomic(_) => 1,
+        };
+        let Fields::Buffer {
+            data: Some(data),
+            cache,
+            ..
+        } = &inst.fields
+        else {
+            return Err("buffer data");
+        };
+        let Operand::Vector { reg, .. } = *data else {
+            return Err("buffer data");
+        };
+        let values = match op {
+            BufferOp::Load(_) => Vec::new(),
+            BufferOp::Store(n) => self.vgprs(inst, data, n as u8)?,
+            BufferOp::Atomic(op) => self.vgprs(inst, data, if op == u32::MAX { 2 } else { 1 })?,
+        };
+        let zero = self.s.m.i32(0);
+        let align = self.s.m.i32(4);
+        let mask = self.s.m.i8(1);
+        for k in 0..count {
+            let (element, member, enabled) = self.structured_component(&address, k, guard);
+            let branch = self.begin_guarded(Some(enabled));
+            match op {
+                BufferOp::Load(_) => {
+                    let r = self.s.op(
+                        self.cur,
+                        "rawBufferLoad.f32",
+                        Attr::ReadOnly,
+                        self.s.t.res_ret,
+                        139,
+                        &[handle, element, member, mask, align],
+                    );
+                    let r = self.s.m.extract(self.cur, r, 0);
+                    let r = self.as_int(r);
+                    let r = self.end_guarded(branch, &[(r, zero)])[0];
+                    self.write(inst, Reg::V(reg + k as u8), r, guard);
+                }
+                BufferOp::Store(_) => {
+                    self.s.op(
+                        self.cur,
+                        "rawBufferStore.i32",
+                        Attr::NoUnwind,
+                        self.s.t.void,
+                        140,
+                        &[
+                            handle,
+                            element,
+                            member,
+                            values[k as usize],
+                            iu,
+                            iu,
+                            iu,
+                            mask,
+                            align,
+                        ],
+                    );
+                    self.end_guarded(branch, &[]);
+                }
+                BufferOp::Atomic(op) => {
+                    let r = if op == u32::MAX {
+                        self.s.op(
+                            self.cur,
+                            "atomicCompareExchange.i32",
+                            Attr::NoUnwind,
+                            i32t,
+                            79,
+                            &[handle, element, member, iu, values[1], values[0]],
+                        )
+                    } else {
+                        let op = self.s.m.i32(op);
+                        self.s.op(
+                            self.cur,
+                            "atomicBinOp.i32",
+                            Attr::NoUnwind,
+                            i32t,
+                            78,
+                            &[handle, op, element, member, iu, values[0]],
+                        )
+                    };
+                    let r = self.end_guarded(branch, &[(r, zero)])[0];
+                    if cache.glc {
+                        self.write(inst, Reg::V(reg), r, guard);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn buffer(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Buffer {
             data,
@@ -6445,6 +6738,18 @@ impl<'a> Lower<'a> {
         let Operand::Vector { reg: areg, .. } = *addr else {
             return Err("a buffer address");
         };
+        let src = self
+            .descriptors
+            .get(&(site, false))
+            .copied()
+            .ok_or("an untracked buffer")?;
+        let used = self.used_kind(src);
+        let structured_stride = if !typed || format.is_some() {
+            self.heap_buffer_stride(src)
+        } else {
+            None
+        };
+        let mut offset_valid = structured_stride.map(|_| self.s.m.bool(true));
         let vaddr = |l: &mut Self, k: u8| -> Result<V, Why> {
             let v = inst.read(Reg::V(areg + k)).ok_or("a buffer address")?;
             l.i32_of(v)
@@ -6453,21 +6758,18 @@ impl<'a> Lower<'a> {
         let mut off = self.s.m.i32(u32::from(*offset));
         if *offen {
             let o = vaddr(self, u8::from(*idxen))?;
-            off = self.s.m.bin(c, Bin::Add, off, o);
+            off = self.buffer_offset_add(off, o, &mut offset_valid);
         }
+        let member = off;
+        let mut scalar = self.s.m.i32(0);
         if !matches!(
             soffset,
             Operand::Scalar { code: NULL, .. } | Operand::Const(128)
         ) {
             let so = self.operand(inst, soffset)?;
+            scalar = so;
             off = self.s.m.bin(c, Bin::Add, off, so);
         }
-        let src = self
-            .descriptors
-            .get(&(site, false))
-            .copied()
-            .ok_or("an untracked buffer")?;
-        let used = self.used_kind(src);
         let (base, extra) = self.built_offset(src)?;
         if base != 0 {
             let b = self.s.m.i32(base);
@@ -6502,6 +6804,27 @@ impl<'a> Lower<'a> {
         }
         let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
+        if !typed && let (Some(stride), Some(valid)) = (structured_stride, offset_valid) {
+            let handle = self.handle(site, src, false, (12 | u, stride))?;
+            let op = if let Some(op) = atomic {
+                BufferOp::Atomic(op)
+            } else if store {
+                BufferOp::Store(count)
+            } else {
+                BufferOp::Load(count)
+            };
+            let address = self.structured_address(
+                handle,
+                BufferAddress {
+                    element: index,
+                    member,
+                    scalar,
+                    valid,
+                    stride,
+                },
+            );
+            return self.structured_buffer(inst, handle, address, op, guard);
+        }
         let iu = self.s.m.undef(self.s.t.i32);
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
@@ -6621,11 +6944,31 @@ impl<'a> Lower<'a> {
             if index.is_some() {
                 return Err("a typed-format load by index");
             }
-            let h = self.handle(site, src, false, (11 | u, 0))?;
+            let (h, address) =
+                if let (Some(stride), Some(valid)) = (structured_stride, offset_valid) {
+                    let h = self.handle(site, src, false, (12 | u, stride))?;
+                    let address = self.structured_address(
+                        h,
+                        BufferAddress {
+                            element: None,
+                            member,
+                            scalar,
+                            valid,
+                            stride,
+                        },
+                    );
+                    (h, Some(address))
+                } else {
+                    (self.handle(site, src, false, (11 | u, 0))?, None)
+                };
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
-            for (k, x) in self.format_load(h, off, f, count)?.into_iter().enumerate() {
+            for (k, x) in self
+                .format_load(h, off, f, count, address.as_ref(), guard)?
+                .into_iter()
+                .enumerate()
+            {
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
@@ -7178,7 +7521,9 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Fields, HashMap, Lower, Lowered, Numeric, Parts, buffer_format, lower};
+    use super::{
+        Fields, HashMap, Lower, Lowered, Numeric, Parts, buffer_format, half_shift, lower,
+    };
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
@@ -7661,9 +8006,81 @@ mod tests {
             buffer_format(77),
             Some((&[32, 32, 32, 32][..], Numeric::Float))
         );
-        // Invalid, a packed float, past the table.
+        // Invalid, past the table.
         assert_eq!(buffer_format(0), None);
-        assert_eq!(buffer_format(36), None);
         assert_eq!(buffer_format(78), None);
+    }
+
+    #[test]
+    fn packed_buffer_formats_by_number() {
+        // LLVM's `UfmtGFX10`: 10_11_11 is 30-36, 11_11_10 37-43,
+        // 10_10_10_2 44-49. Channels from the lowest bits: R11G11B10_FLOAT
+        // is 10_11_11 (Mesa), 10_10_10_2 has the 2-bit channel first.
+        assert_eq!(buffer_format(30), Some((&[11, 11, 10][..], Numeric::Unorm)));
+        assert_eq!(buffer_format(36), Some((&[11, 11, 10][..], Numeric::Float)));
+        assert_eq!(buffer_format(37), Some((&[10, 11, 11][..], Numeric::Unorm)));
+        assert_eq!(buffer_format(43), Some((&[10, 11, 11][..], Numeric::Float)));
+        assert_eq!(
+            buffer_format(44),
+            Some((&[2, 10, 10, 10][..], Numeric::Unorm))
+        );
+        assert_eq!(
+            buffer_format(45),
+            Some((&[2, 10, 10, 10][..], Numeric::Snorm))
+        );
+        assert_eq!(
+            buffer_format(46),
+            Some((&[2, 10, 10, 10][..], Numeric::Uscaled))
+        );
+        assert_eq!(
+            buffer_format(47),
+            Some((&[2, 10, 10, 10][..], Numeric::Sscaled))
+        );
+        assert_eq!(
+            buffer_format(48),
+            Some((&[2, 10, 10, 10][..], Numeric::Uint))
+        );
+        assert_eq!(
+            buffer_format(49),
+            Some((&[2, 10, 10, 10][..], Numeric::Sint))
+        );
+    }
+
+    /// A half's value (sign, 5-bit exponent biased 15, 10-bit mantissa), as
+    /// `legacyF16ToF32` widens it.
+    fn half(h: u32) -> f32 {
+        let (s, e, m) = ((h >> 15) & 1, (h >> 10) & 31, h & 1023);
+        let v = match e {
+            0 => m as f32 * 2f32.powi(-24),
+            31 if m == 0 => f32::INFINITY,
+            31 => f32::NAN,
+            _ => (1024 + m) as f32 * 2f32.powi(e as i32 - 25),
+        };
+        if s == 1 { -v } else { v }
+    }
+
+    #[test]
+    fn small_floats_widen_as_halves() {
+        // Unsigned 11- and 10-bit floats: a 5-bit exponent biased 15 over a
+        // 6- or 5-bit mantissa, no sign; values from the D3D/GL spec.
+        let f11 = |x: u32| half(x << half_shift(11));
+        let f10 = |x: u32| half(x << half_shift(10));
+        assert_eq!(f11(0), 0.0);
+        assert_eq!(f11(0x001), 2f32.powi(-20)); // smallest denormal
+        assert_eq!(f11(0x03F), 63.0 * 2f32.powi(-20)); // largest denormal
+        assert_eq!(f11(0x040), 2f32.powi(-14)); // smallest normal
+        assert_eq!(f11(0x3C0), 1.0);
+        assert_eq!(f11(0x3E0), 1.5);
+        assert_eq!(f11(0x7BF), 65024.0); // largest
+        assert_eq!(f11(0x7C0), f32::INFINITY);
+        assert!(f11(0x7C1).is_nan());
+        assert_eq!(f10(0x001), 2f32.powi(-19));
+        assert_eq!(f10(0x020), 2f32.powi(-14));
+        assert_eq!(f10(0x1E0), 1.0);
+        assert_eq!(f10(0x3DF), 64512.0);
+        assert_eq!(f10(0x3E0), f32::INFINITY);
+        assert!(f10(0x3FF).is_nan());
+        // A 16-bit float is a half already, sign included.
+        assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
     }
 }

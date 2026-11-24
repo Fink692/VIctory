@@ -41,8 +41,11 @@
 //!   that buffer (per-stream headers), not descriptor fields.
 //! * **Buffer views in the heap** are declared by how the shader reads
 //!   them: raw (ByteAddressBuffer) for dword loads and stores, atomics and
-//!   typed-format loads without an index; structured with the used-resource
-//!   entry's stride when indexed; typed with four 32-bit float channels for
+//!   typed-format loads without a known record stride; structured with the
+//!   used-resource entry's stride, for both indexed and byte-addressed
+//!   accesses. Byte addresses become record/member coordinates per dword,
+//!   while indexed addresses keep their full record index. Typed views
+//!   have four 32-bit float channels for
 //!   `buffer_load_format_*` and `buffer_store_format_*`. The host's view at
 //!   that index must be of that kind and start at the console descriptor's
 //!   base address (raw: `R32_TYPELESS` with the raw flag), whatever kind the
@@ -81,7 +84,11 @@
 #[cfg(test)]
 mod atomic_tests;
 mod bitcode;
+#[cfg(test)]
+mod buffer_tests;
 mod container;
+#[cfg(test)]
+mod depth_tests;
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
@@ -287,6 +294,13 @@ pub fn emit(
             (0, _) => 1,
             _ => 0,
         };
+    }
+    // With a conservative depth output (SV_DepthLessEqual, GreaterEqual) DXIL
+    // wants the position centroid (or per sample), as DXC declares it then.
+    if pixel && outputs.iter().any(|e| matches!(e.kind, 18 | 19)) {
+        for e in inputs.iter_mut().filter(|e| e.kind == 3) {
+            e.interp = 5;
+        }
     }
     // Per-primitive outputs are constant. The console never exports a
     // primitive id or cull flag a mesh shader writes (it culls with the

@@ -15,11 +15,13 @@ query and diagnostic protections. It does not merge the entire fork.
 | Area | Evidence and decision |
 |---|---|
 | Visible game world | The fork's [pinned README](https://github.com/fxceless/victory-fork/blob/4e17478b9c27bb530643e5b0e16a767cf4419e08/README.md) reports a visible prologue, incomplete lighting and about 2–4 FPS on an RTX 4070. Those are its author's observations. We did not execute a title, and cannot rank gameplay speed or correctness on equivalent hardware. |
-| Shader coverage | The fork contains newer upstream opcode, numerical, metadata and per-lane descriptor fixes. Selected ports add supported operations and correctly track descriptors through branches and recognized waterfall loops. New synthetic tests cover the added behavior and unsafe loop forms are rejected. |
+| Shader coverage | The fork contains newer upstream opcode, numerical, metadata and per-lane descriptor fixes. Selected ports add supported operations and correctly track descriptors through branches and recognized waterfall loops. New synthetic tests cover the added behavior, conservative depth metadata and twenty packed buffer formats; unsafe loop forms are rejected. |
+| Mixed buffer access | The fork identifies a mismatch between byte-addressed vector shader operations and structured descriptors. The adaptation retains structured views and expresses byte offsets as record/member coordinates, preserving native view alignment and indexed extent while making both access forms agree. |
 | CPU texture work | Its BCPack lookup and fixed-width texture-copy loops are measurably faster on the same authored inputs. Both were adopted, along with its BC7 dictionary-layout correction. |
 | Pipeline compilation | Its shared wait budget and request priority address excessive waits across recording threads. We adapted these with explicit reservation/refund accounting, stale-frame protection and tests. |
 | Runtime services | Seven test-only regressions demonstrated defects in our old baseline. The selected upstream fixes address save-folder isolation, async results, queue wakeup, audio arithmetic, configuration and API results; related Windows-only fixes have authored tests. |
 | GPU ordering and repeat execution | We retain our GPU-produced constants, ordered raw copies, retained descriptors, rectangle expansion, fence semantics and native regression matrices. Some fork performance paths release descriptors after execution or use experimental queue lifetimes, so a wholesale replacement would lose these protections. |
+| Implicit lighting texture aliases | The fork propagates GPU-written packed lighting through distinct texture views sharing title memory. This is a material rendering capability not established by our explicit texture-copy tests. Its address/flag heuristic is not adopted without CPU/GPU coherence guarantees; see the limitation below. |
 | Verification and diagnostics | Our full portable workspace builds on Linux; the compared fork fails compilation there in Windows-only loader code. Its Windows CI succeeds. Our pinned WARP, strict case markers, native debugger reports and retained CI artifacts remain in place, with new required descriptor and shader gates. Test counts alone are not a correctness ranking. |
 
 ## Measured CPU changes
@@ -34,7 +36,8 @@ These are component throughput measurements, not game FPS or loading-time claims
 
 Each sample decodes 16,384 blocks forty times using the same synthetic tables
 and streams. The fork's benchmark helper was also applied to the unchanged
-baseline production code.
+baseline production code. Encoded input lengths and FNV-64 hashes match between
+the two harnesses, in addition to their decoded-output assertions.
 
 | Format | Old baseline, ns/block | Fork/adopted implementation, ns/block | Throughput ratio |
 |---|---:|---:|---:|
@@ -108,7 +111,29 @@ A shader regression also demonstrates that the old transitive phi analysis
 could overlook an unsupported timestamp read through two joins. The new analysis
 treats the joined and direct forms consistently. Additional authored shaders
 check per-lane texture/buffer selection, constant sample offsets, half operations,
-NaN comparisons, signed zero and pixel-stage metadata.
+NaN comparisons, signed zero and pixel-stage metadata. The authored conservative
+depth fixture fails on the baseline's position interpolation metadata, and the
+packed-format fixture fails there with an unsupported-format error. Both pass
+with the selected corrections.
+
+Mixed byte-addressed/indexed vector buffer access uses a local adaptation of the fork's
+diagnosis. [DXIL's buffer contract](https://github.com/microsoft/DirectXShaderCompiler/blob/main/docs/DXIL.rst#rawbufferload)
+allows structured handles to carry an element index plus a member byte offset.
+The compiler keeps indexed coordinates and uses quotient/remainder coordinates
+for vector byte-addressed operations, with checked carries, per-component member bounds
+and the original descriptor record count. This avoids flattening large indexed
+addresses into a 32-bit byte offset. Native host views retain valid 4/8/12-byte
+starts and their existing typed component mappings. Structured ranges above
+4 GiB are checked arithmetically; CI does not allocate a multi-gigabyte fixture.
+
+The indexed bounds model follows structured mode (`OOB_SELECT=0`) in AMD's
+[RDNA 2 ISA, section 8.1.2](https://docs.amd.com/api/khub/documents/Et~wpu9g~Ffl7d9q0QZ~Og/content).
+Scalar offsets move the base independently of member bounds. Other descriptor
+bounds modes are not represented in the current shader resource metadata and
+are not claimed as newly supported. This adaptation covers vector MUBUF and
+explicit-format MTBUF instructions. The inherited scalar `s_buffer_load_dword*`
+SRV path can still declare a raw handle for structured metadata and remains a
+separate limitation; this change does not claim every buffer instruction is fixed.
 
 Windows acceptance uses `scripts/Test-Victory.ps1 -RequireGpu -NativeShaderDebug`.
 It retains every prior required gate and adds explicit coverage requirements for:
@@ -116,6 +141,13 @@ It retains every prior required gate and adds explicit coverage requirements for
 - Six waterfall programs, with all 32 lanes checked in every execution.
 - Five texture offsets per backend, with all 16 pixels checked each time.
 - Three descriptor exhaustion/drop/recovery scenarios with zero native errors.
+- Three independently validated ordinary/conservative depth output containers.
+- Twenty packed formats plus three multi-dword formats: 126 cases per backend,
+  including 36 structured and cross-record cases.
+- Twenty mixed-access programs and thirteen offset/bounds cases per execution,
+  including byte reads, indexed reads, stores, atomics and untouched guards.
+- Twenty-six native descriptor scenarios preserving structured, raw and typed
+  views, with zero debug-layer validation errors.
 
 The rectangle matrix remains twenty-four scenarios; its half-edge scenario now
 includes every signed half subnormal and retains the existing signed-zero checks.
@@ -131,6 +163,15 @@ Its geometry-stage rectangle expansion also needs indexed, indirect and nonlinea
 vertex-shader coverage before replacing our tested input-expansion path. The
 fork's implicit-LOD and explicit-gather shortcuts were not copied as complete
 sampling implementations.
+
+Its implicit `R32_UINT` to `R9G9B9E5` texture alias path remains unported.
+An exact-range, owned-resource GPU copy is only part of this fix: the present
+texture upload path can still overwrite GPU-produced data with unchanged CPU
+staging bytes, while suppressing uploads would lose later CPU writes. Partial
+CPU writes also need to preserve untouched GPU-produced texels. A safe adaptation
+therefore needs ordered ownership/refresh and changed-region merging, alongside
+exact layout matching, ambiguity rejection and retained native resources. Our
+explicit texture-copy gates do not prove those implicit alias semantics.
 
 The optional console-instruction emulator was excluded: its source contains
 an explicit GPL-2.0-only provenance notice despite the enclosing fork's

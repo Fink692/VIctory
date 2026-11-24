@@ -24,7 +24,7 @@ use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
 #[cfg(test)]
-mod constant_tests;
+pub(crate) mod constant_tests;
 
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]

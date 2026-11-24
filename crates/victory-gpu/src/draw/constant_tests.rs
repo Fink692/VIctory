@@ -9,14 +9,14 @@ use windows::core::{PCSTR, s};
 
 type Messages = std::sync::Mutex<Vec<String>>;
 
-struct Validation {
+pub(crate) struct Validation {
     queue: ID3D12InfoQueue1,
     messages: Box<Messages>,
     cookie: u32,
 }
 
 impl Validation {
-    fn new(device: &ID3D12Device) -> Self {
+    pub(crate) fn new(device: &ID3D12Device) -> Self {
         unsafe extern "system" fn message(
             _: D3D12_MESSAGE_CATEGORY,
             severity: D3D12_MESSAGE_SEVERITY,
@@ -65,7 +65,7 @@ impl Validation {
         result
     }
 
-    fn check(&self) {
+    pub(crate) fn check(&self) {
         let messages = self.messages.lock().unwrap_or_else(|e| e.into_inner());
         assert!(
             messages.is_empty(),

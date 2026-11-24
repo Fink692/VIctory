@@ -326,6 +326,59 @@ function Get-VictoryDescriptorExhaustionCoverage {
     return [ordered]@{ status = 'executed'; cases = 3; validation_errors = 0 }
 }
 
+function Get-VictoryBufferViewCoverage {
+    param([Parameter(Mandatory)][string]$Output)
+    $results = [regex]::Matches($Output, '(?m)^VICTORY_BUFFER_VIEW_RESULT=.*\r?$')
+    $coverageMatches = [regex]::Matches($Output, '(?m)^VICTORY_BUFFER_VIEW_RESULT=executed cases=26 validation_errors=0\r?$')
+    if ($results.Count -ne 1 -or $coverageMatches.Count -ne 1) {
+        throw 'Buffer views must execute all twenty-six structured, raw and typed preservation scenarios with zero native validation errors.'
+    }
+    return [ordered]@{ status = 'executed'; cases = 26; validation_errors = 0 }
+}
+
+function Get-VictoryIndexedBufferCoverage {
+    param([Parameter(Mandatory)][string]$Output)
+    $results = [regex]::Matches($Output, '(?m)^VICTORY_INDEXED_BUFFER_RESULT=.*\r?$')
+    $coverageMatches = [regex]::Matches($Output, '(?m)^VICTORY_INDEXED_BUFFER_RESULT=executed programs=(\d+) executions=(\d+) cases=(\d+)\r?$')
+    if ($results.Count -ne 1 -or $coverageMatches.Count -ne 1) {
+        throw 'Mixed buffer access must report exactly one complete native execution result.'
+    }
+    $programs = [uint32]$coverageMatches[0].Groups[1].Value
+    $executions = [uint32]$coverageMatches[0].Groups[2].Value
+    $cases = [uint64]$coverageMatches[0].Groups[3].Value
+    if ($programs -ne 20 -or $executions -lt 20 -or ($executions % 20) -ne 0 -or $cases -ne ([uint64]$executions * 13)) {
+        throw 'Mixed buffer access must execute all twenty programs and thirteen offset/bounds cases per execution.'
+    }
+    return [ordered]@{ status = 'executed'; programs = $programs; executions = $executions; cases = $cases }
+}
+
+function Get-VictoryDepthValidationCoverage {
+    param([Parameter(Mandatory)][string]$Output)
+    $results = [regex]::Matches($Output, '(?m)^VICTORY_DEPTH_VALIDATION_RESULT=.*\r?$')
+    $coverageMatches = [regex]::Matches($Output, '(?m)^VICTORY_DEPTH_VALIDATION_RESULT=validated containers=3\r?$')
+    if ($results.Count -ne 1 -or $coverageMatches.Count -ne 1) {
+        throw 'Depth exports must independently validate ordinary, less-equal and greater-equal output containers.'
+    }
+    return [ordered]@{ status = 'validated'; containers = 3 }
+}
+
+function Get-VictoryPackedBufferCoverage {
+    param([Parameter(Mandatory)][string]$Output)
+    $results = [regex]::Matches($Output, '(?m)^VICTORY_PACKED_BUFFER_RESULT=.*\r?$')
+    $coverageMatches = [regex]::Matches($Output, '(?m)^VICTORY_PACKED_BUFFER_RESULT=executed formats=(\d+) backends=(\d+) cases=(\d+) structured_cases=(\d+)\r?$')
+    if ($results.Count -ne 1 -or $coverageMatches.Count -ne 1) {
+        throw 'Packed buffers must report exactly one complete native execution result.'
+    }
+    $formats = [uint32]$coverageMatches[0].Groups[1].Value
+    $backends = [uint32]$coverageMatches[0].Groups[2].Value
+    $cases = [uint64]$coverageMatches[0].Groups[3].Value
+    $structuredCases = [uint64]$coverageMatches[0].Groups[4].Value
+    if ($formats -ne 23 -or $backends -eq 0 -or $cases -ne ([uint64]$backends * 126) -or $structuredCases -ne ([uint64]$backends * 36)) {
+        throw 'Packed buffers must execute all twenty-three formats and 126 cases, including 36 structured cases, on every reported backend.'
+    }
+    return [ordered]@{ status = 'executed'; formats = $formats; backends = $backends; cases = $cases; structured_cases = $structuredCases }
+}
+
 function Get-VictoryDepthBoundsCoverage {
     param([Parameter(Mandatory)][string]$Output)
     $coverageMatches = [regex]::Matches($Output, '(?m)^VICTORY_DEPTH_BOUNDS_RESULT=(executed|unsupported) cases=(\d+)\r?$')
