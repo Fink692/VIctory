@@ -95,6 +95,44 @@ CI preserves `.native.log` and `native-shader.json` alongside the other
 synthetic logs; no process memory dumps are written. `-CdbPath`, `-Attempts`
 and `-TestThreads` are available when invoking the script directly.
 
+The same flag also runs `Test-NativeGpu.ps1`. It launches the compressed
+texture-copy and depth-bounds controls in separate CDB processes, with the
+D3D12 debug layer and flushed operation traces. It captures both access
+violations and native aborts, and records each result in `native-gpu.json`.
+The depth control prints every original case and, on a mismatch, compares
+title state updates with direct native calls and ordinary depth tests.
+These extra probes do not change the required results. Independent checks
+continue after a failure so their evidence is retained; any failed check
+still fails the overall command.
+
+### Compare software-renderer versions
+
+`Test-WarpComparison.ps1` replays the two native reports against the Windows
+inbox WARP and Microsoft's pinned
+[WARP 1.0.22 package](https://www.nuget.org/packages/Microsoft.Direct3D.WARP/1.0.22).
+Run the native checks first, then supply their exact report paths:
+
+```powershell
+pwsh -NoProfile -File scripts/Test-WarpComparison.ps1 `
+  -RepositoryRoot (Get-Location).Path `
+  -ShaderReportPath 'D:\VIctory-reports\native-shader.json' `
+  -GpuReportPath 'D:\VIctory-reports\native-gpu.json'
+```
+
+The comparison verifies the package and x64 DLL hashes, copies the same
+test executable bytes into separate external application directories, and
+preserves the original test arguments and concurrency. Each child gets a
+fresh cache. The debugger must confirm the expected loaded DLL path and
+version before a result is accepted. `warp-comparison.json` records both
+sets of results; a passing newer-runtime control cannot erase an inbox
+failure. The existing target directory and installed Windows files are
+unchanged. The package is for testing and development; its binaries and
+symbols are excluded from the repository and CI artifacts.
+
+CI currently runs this comparison after the normal Windows gate, retaining
+failures in both. This is a diagnostic comparison, not a claim that either
+runtime passes or that a physical GPU/title has been tested.
+
 ### Optional independent DXIL validation
 
 The synthetic image-atomic matrix can also validate all 88 emitted

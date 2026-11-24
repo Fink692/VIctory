@@ -75,6 +75,7 @@ try {
     @"
 sxd -c2 "$exceptionCommands" av
 sxd -c2 "$exceptionCommands" 0xc0000409
+sxn out
 .echo VICTORY_NATIVE_DEBUGGER_READY
 g
 "@ | Set-Content -LiteralPath $commands -Encoding ascii

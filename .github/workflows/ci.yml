@@ -63,6 +63,13 @@ jobs:
         env:
           FORMAT_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before || inputs.format_base_ref }}
         run: ./scripts/Test-Victory.ps1 -RequireGpu -NativeShaderDebug -FormatBaseRef "$env:FORMAT_BASE_REF" -OutputRoot "$env:RUNNER_TEMP/victory-checks"
+      - name: Compare inbox and pinned Microsoft WARP
+        if: ${{ !cancelled() }}
+        run: |
+          $shader = @(Get-ChildItem -LiteralPath "$env:RUNNER_TEMP/victory-checks" -Filter native-shader.json -Recurse)
+          $gpu = @(Get-ChildItem -LiteralPath "$env:RUNNER_TEMP/victory-checks" -Filter native-gpu.json -Recurse)
+          if ($shader.Count -ne 1 -or $gpu.Count -ne 1) { throw 'The exact native test reports are required for WARP comparison.' }
+          ./scripts/Test-WarpComparison.ps1 -RepositoryRoot "$env:GITHUB_WORKSPACE" -ShaderReportPath $shader[0].FullName -GpuReportPath $gpu[0].FullName -OutputRoot "$env:RUNNER_TEMP/victory-checks"
       - name: Keep asset-free validation logs
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -76,5 +83,6 @@ jobs:
             ${{ runner.temp }}/victory-checks/**/*.native.log
             ${{ runner.temp }}/victory-checks/**/native-shader.json
             ${{ runner.temp }}/victory-checks/**/native-gpu.json
+            ${{ runner.temp }}/victory-checks/**/warp-comparison.json
           if-no-files-found: ignore
           retention-days: 7

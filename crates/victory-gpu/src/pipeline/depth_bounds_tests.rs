@@ -6,7 +6,122 @@ use crate::object::{self, This};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-use windows::core::{PCSTR, s};
+use windows::core::{Interface, PCSTR, s};
+
+type Messages = std::sync::Mutex<Vec<(D3D12_MESSAGE_ID, D3D12_MESSAGE_SEVERITY, String)>>;
+
+/// Observe validation even when Host::execute drains the native queue.
+/// Inverted ranges have a specified result and an intentional diagnostic;
+/// every other native error invalidates the measurement.
+struct Validation {
+    queue: Option<ID3D12InfoQueue1>,
+    messages: Box<Messages>,
+    cookie: u32,
+}
+
+impl Validation {
+    fn new(device: &ID3D12Device) -> Self {
+        unsafe extern "system" fn message(
+            _: D3D12_MESSAGE_CATEGORY,
+            severity: D3D12_MESSAGE_SEVERITY,
+            id: D3D12_MESSAGE_ID,
+            description: PCSTR,
+            context: *mut std::ffi::c_void,
+        ) {
+            if severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0
+                || id == D3D12_MESSAGE_ID_SETDEPTHBOUNDS_INVALIDARGS
+            {
+                // SAFETY: the boxed context outlives registration and the
+                // callback's description is valid for this invocation.
+                let (messages, text) = unsafe {
+                    (
+                        &*context.cast::<Messages>(),
+                        std::ffi::CStr::from_ptr(description.0.cast())
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
+                };
+                messages
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((id, severity, text));
+            }
+        }
+        let mut validation = Self {
+            queue: None,
+            messages: Box::default(),
+            cookie: 0,
+        };
+        if cfg!(feature = "diagnostics")
+            && std::env::var("VICTORY_D3D12_DEBUG").is_ok_and(|v| v == "1")
+        {
+            let queue = device
+                .cast::<ID3D12InfoQueue1>()
+                .expect("the requested debug layer must support message capture");
+            // SAFETY: a stable boxed context, unregistered before release.
+            // The callback records messages without calling back into D3D.
+            unsafe {
+                queue
+                    .RegisterMessageCallback(
+                        Some(message),
+                        D3D12_MESSAGE_CALLBACK_IGNORE_FILTERS,
+                        (&raw mut *validation.messages).cast(),
+                        &mut validation.cookie,
+                    )
+                    .unwrap();
+            }
+            validation.queue = Some(queue);
+        }
+        validation
+    }
+
+    fn check(&self, phase: &str, expected_inversions: usize) {
+        if self.queue.is_none() {
+            return;
+        }
+        let messages =
+            std::mem::take(&mut *self.messages.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut inversions = 0;
+        let mut unexpected = Vec::new();
+        for (id, severity, text) in messages {
+            eprintln!(
+                "VICTORY_DEPTH_BOUNDS_VALIDATION_MESSAGE phase={phase} id={} severity={} {text}",
+                id.0, severity.0
+            );
+            if id == D3D12_MESSAGE_ID_SETDEPTHBOUNDS_INVALIDARGS
+                && matches!(
+                    severity,
+                    D3D12_MESSAGE_SEVERITY_ERROR | D3D12_MESSAGE_SEVERITY_WARNING
+                )
+            {
+                inversions += 1;
+            } else {
+                unexpected.push(text);
+            }
+        }
+        assert!(
+            unexpected.is_empty(),
+            "{phase}: native validation errors: {unexpected:?}"
+        );
+        assert_eq!(
+            inversions, expected_inversions,
+            "{phase}: inverted-range diagnostics"
+        );
+    }
+}
+
+impl Drop for Validation {
+    fn drop(&mut self) {
+        if let Some(queue) = &self.queue {
+            // SAFETY: the registration and its context are still live.
+            if let Err(error) = unsafe { queue.UnregisterMessageCallback(self.cookie) } {
+                eprintln!("could not unregister depth validation callback: {error}");
+                // Preserve the callback's context on an unexpected failure.
+                Box::leak(std::mem::take(&mut self.messages));
+            }
+        }
+    }
+}
 
 #[test]
 fn depth_bounds_stream_state_survives_and_changes_cache_identity() {
@@ -213,9 +328,34 @@ fn depth_bounds_filter_stored_depth_and_reset() {
         eprintln!("VICTORY_DEPTH_BOUNDS_RESULT=unsupported cases=0");
         return;
     }
+    let validation = Validation::new(&host.device);
+    assert!(
+        host.log_messages().is_none(),
+        "device initialization produced native errors"
+    );
     let vs = compile(s!("vs"), s!("vs_5_0"));
     let ps = compile(s!("ps"), s!("ps_5_0"));
     let (root, root_blob) = root_signature(&host.device, &[], &[], false).unwrap();
+    // The translated root signature enables both directly indexed heaps.
+    // D3D12 requires them to be bound before that root signature even
+    // though these authored shaders do not read any heap descriptors.
+    let heaps = [
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+        D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+    ]
+    .map(|kind| {
+        // SAFETY: a nonempty shader-visible heap of a supported type.
+        Some(unsafe {
+            host.device
+                .CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: kind,
+                    NumDescriptors: 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    ..Default::default()
+                })
+                .unwrap()
+        })
+    });
     let mut g = GraphicsState::default();
     g.depth.DepthEnable = false.into();
     g.depth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
@@ -316,6 +456,7 @@ fn depth_bounds_filter_stored_depth_and_reset() {
     let bind = || {
         // SAFETY: the list is open and all referenced objects remain live.
         unsafe {
+            list.list.SetDescriptorHeaps(&heaps);
             list.list.SetGraphicsRootSignature(&root);
             list.list
                 .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -334,6 +475,7 @@ fn depth_bounds_filter_stored_depth_and_reset() {
             list.list
                 .OMSetRenderTargets(1, Some(&rtv), false, Some(&dsv));
         }
+        validation.check("bind", 0);
     };
     let draw = |index: u32, enabled: bool, stored: f32| {
         // SAFETY: live descriptors, PSO and query index inside the heap.
@@ -351,7 +493,13 @@ fn depth_bounds_filter_stored_depth_and_reset() {
     bind();
     for (index, &(enabled, range, stored, _)) in cases.iter().enumerate() {
         if let Some((min, max)) = range {
+            validation.check("before-bounds", 0);
             title.set_bounds(min, max);
+            // The depth-bounds specification requires inverted intervals
+            // to reach the driver and reject samples despite a diagnostic.
+            // Scope the sole permitted message to this exact setter call.
+            let value = |x: f32| if x.is_nan() { 0.0 } else { x };
+            validation.check("bounds", usize::from(value(min) > value(max)));
         }
         draw(index as u32, enabled, stored);
     }
@@ -367,7 +515,9 @@ fn depth_bounds_filter_stored_depth_and_reset() {
         );
     }
     list.close();
+    validation.check("initial-close", 0);
     host.execute(&[list]);
+    validation.check("initial-execute", 0);
     title.reset();
     bind();
     draw(count - 1, true, 0.5);
@@ -385,7 +535,9 @@ fn depth_bounds_filter_stored_depth_and_reset() {
         );
     }
     list.close();
+    validation.check("reset-close", 0);
     host.execute(&[list]);
+    validation.check("reset-execute", 0);
     let samples = read_samples(&readback, count as usize);
     if std::env::var("VICTORY_DEPTH_BOUNDS_TRACE").is_ok_and(|v| v == "1") {
         for (index, &(enabled, range, stored, expected)) in cases.iter().enumerate() {
@@ -405,7 +557,6 @@ fn depth_bounds_filter_stored_depth_and_reset() {
             .any(|(index, case)| samples[index] != case.3)
             || samples[count as usize - 1] != 1;
         if failed {
-            use windows::core::Interface;
             let native = list.list.cast::<ID3D12GraphicsCommandList1>().unwrap();
             // These failure diagnostics retain the original assertions.
             // Compare the title route with a direct native call, then
@@ -481,13 +632,21 @@ fn depth_bounds_filter_stored_depth_and_reset() {
                     );
                 }
                 list.close();
+                validation.check("probe-close", 0);
                 host.execute(&[list]);
+                validation.check("probe-execute", 0);
                 let actual = read_samples(&readback, 1)[0];
                 eprintln!(
                     "VICTORY_DEPTH_BOUNDS_PROBE label={label} range=[0.75,1] stored=0.5 expected={expected} actual={actual}"
                 );
             }
         }
+    }
+    validation.check("complete", 0);
+    if validation.queue.is_some() {
+        eprintln!(
+            "VICTORY_DEPTH_BOUNDS_VALIDATION=checked expected_inversions=2 unexpected_errors=0"
+        );
     }
     for (index, &(_, range, stored, expected)) in cases.iter().enumerate() {
         assert_eq!(

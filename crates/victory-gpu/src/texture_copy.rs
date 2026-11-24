@@ -471,12 +471,11 @@ pub(crate) fn record(
         }
     };
     let native_box = region.map(|mut b| {
-        // A staged BC image has complete-block dimensions. Its source box
-        // must name the complete last block, even when the title box ended
-        // at the original texture's smaller logical mip edge. Bounds and
-        // block-aligned starts were checked before recording any commands.
-        if source_stage.is_some()
-            && let Some((_, block)) = crate::resource::element(source.format())
+        // Native BC copies address complete physical blocks for both
+        // textures and placed footprints. Expand a validated logical mip
+        // edge to its full last block. Physical bounds and block-aligned
+        // starts were checked before recording any commands.
+        if let Some((_, block)) = crate::resource::element(source.format())
             && block > 1
         {
             b[3] = b[3].next_multiple_of(block as u32);
