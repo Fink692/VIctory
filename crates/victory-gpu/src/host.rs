@@ -400,9 +400,6 @@ pub(crate) struct HostList {
     pub(crate) list: ID3D12GraphicsCommandList,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
-    /// Upload memory for data the list's draws make (expanded vertices),
-    /// reused after a reset.
-    scratch: Mutex<Scratch>,
     /// Host texture states the list assumes, by host copy: at its start and
     /// at its end. Lists are recorded on many threads and run in submission
     /// order, so the transitions from a texture's real state are made at
@@ -476,20 +473,6 @@ pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
     }
 }
 
-/// Upload chunks handed out front to back: the chunks, the one in use and
-/// the bytes used in it.
-#[derive(Default)]
-struct Scratch {
-    chunks: Vec<(ID3D12Resource, usize, u64)>,
-    current: usize,
-    used: u64,
-}
-
-// SAFETY: the chunk pointers are persistent mappings of upload buffers.
-unsafe impl Send for Scratch {}
-
-const SCRATCH_CHUNK: u64 = 4 << 20;
-
 /// One piece of submission-time work, in recorded order.
 enum Step {
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
@@ -511,7 +494,6 @@ enum Step {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
-    uploads: Vec<ID3D12Resource>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
@@ -763,7 +745,6 @@ impl Host {
                 allocator,
                 list,
                 deferred: Mutex::default(),
-                scratch: Mutex::default(),
                 states: Mutex::default(),
                 buffer_states: Mutex::default(),
                 buffer_bindings: Mutex::default(),
@@ -1254,10 +1235,6 @@ impl HostList {
             .clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        {
-            let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
-            (scratch.current, scratch.used) = (0, 0);
-        }
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -1528,37 +1505,6 @@ impl HostList {
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
-    /// `len` bytes of upload memory (256-byte aligned) until the list is
-    /// reset: the host GPU address and the CPU pointer.
-    pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
-        let host = host()?;
-        let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
-        let len = len.max(1).next_multiple_of(256);
-        if len > SCRATCH_CHUNK {
-            let (buffer, data) = host.upload_buffer(len)?;
-            name(&buffer, || format!("list scratch {len:#x}"));
-            // SAFETY: a live buffer.
-            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            self.deferred().uploads.push(buffer);
-            return Some((gpu, data));
-        }
-        if s.used + len > SCRATCH_CHUNK && s.current < s.chunks.len() {
-            (s.current, s.used) = (s.current + 1, 0);
-        }
-        if s.current == s.chunks.len() {
-            let (buffer, data) = host.upload_buffer(SCRATCH_CHUNK)?;
-            name(&buffer, || "list scratch".into());
-            // SAFETY: a live buffer.
-            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            s.chunks.push((buffer, data as usize, gpu));
-            s.used = 0;
-        }
-        let (_, data, gpu) = s.chunks[s.current];
-        let at = s.used;
-        s.used += len;
-        Some((gpu + at, (data + at as usize) as *mut u8))
-    }
-
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
     pub(crate) fn budget(&self) -> Option<u64> {
@@ -1593,12 +1539,6 @@ impl HostList {
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
         self.deferred().textures.insert(key)
-    }
-
-    /// Prepares host memory when the list is submitted. GPU-produced
-    /// inputs must instead be consumed by a recorded native command.
-    pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Host(Box::new(work)));
     }
 
     /// Brings a texture's staging buffer up to date when the list is

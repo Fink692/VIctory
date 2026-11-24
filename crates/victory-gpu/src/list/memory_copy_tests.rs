@@ -140,6 +140,7 @@ impl Recorded {
     fn memory_copy(&self, to: u64, from: u64, len: u64) {
         // Exercise the title-facing vtable. Its own table, rather than
         // the mutable global layout setting, selects the console slot.
+        // SAFETY: this wrapper owns a live title List until its Drop.
         let table = unsafe { *self.title.cast::<*const *const ()>() };
         let index = if table == NEWER_LIST_FUNCTIONS.0.as_ptr() {
             62

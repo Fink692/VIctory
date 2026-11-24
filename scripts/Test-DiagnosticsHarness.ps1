@@ -103,6 +103,14 @@ exit $ExitCode
     Assert-Rejected { Get-VictoryConstantCoverage $constantOk.Replace('validation_errors=0', 'validation_errors=1') 24 } 'Native constant errors must fail.'
     Assert-Rejected { Get-VictoryConstantCoverage 'test result: ok. 1 passed;' 24 } 'Test discovery cannot substitute for constant execution.'
     Assert-Rejected { Get-VictoryConstantCoverage ($constantOk + "`n" + $constantOk) 24 } 'Duplicate constant execution markers must fail.'
+    $rectangleOk = 'VICTORY_RECTANGLE_RESULT=executed cases=12 validation_errors=0'
+    $coverage = Get-VictoryRectangleCoverage $rectangleOk 12
+    Assert-That ($coverage.cases -eq 12 -and $coverage.validation_errors -eq 0) 'Rectangle output requires all native cases and clean validation.'
+    Assert-Rejected { Get-VictoryRectangleCoverage $rectangleOk 11 } 'Rectangle coverage must match the required matrix.'
+    Assert-Rejected { Get-VictoryRectangleCoverage $rectangleOk.Replace('validation_errors=0', 'validation_errors=1') 12 } 'Native rectangle errors must fail.'
+    Assert-Rejected { Get-VictoryRectangleCoverage 'test result: ok. 1 passed;' 12 } 'Test discovery cannot substitute for rectangle execution.'
+    Assert-Rejected { Get-VictoryRectangleCoverage ($rectangleOk + "`n" + $rectangleOk) 12 } 'Duplicate rectangle markers must fail.'
+    Assert-Rejected { Get-VictoryRectangleCoverage ($rectangleOk + "`nVICTORY_RECTANGLE_RESULT=unsupported cases=0 validation_errors=0") 12 } 'Conflicting rectangle markers must fail.'
     $copyOk = "VICTORY_MEMORY_COPY_RESULT=executed cases=6`nVICTORY_MEMORY_COPY_VALIDATION=checked unexpected_errors=0"
     $coverage = Get-VictoryMemoryCopyCoverage $copyOk
     Assert-That ($coverage.cases -eq 6 -and $coverage.validation -eq 'checked') 'All raw-copy cases require native validation.'

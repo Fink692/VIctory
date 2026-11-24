@@ -17,6 +17,7 @@ evidence; it does not claim that the title is playable.
 | GPU queries and ordering | Allocate host query heaps, record begin/end/resolve operations, preserve query lifetime through submission, track host buffer states and perform buffer copies on the GPU. Use the host queue's clock/frequency. | Required hosted Windows/WARP tests passed for timestamp destinations, measured empty occlusion/statistics queries and resolve-to-copy ordering. Physical GPU/title execution remains required. |
 | Texture copies and readback | Copy buffer footprints through GPU staging so earlier GPU writes are visible; implement texture-to-buffer readback, partial destinations and same-texture mip copies. Validate ranges and repack title row pitches/offsets into native layouts; expand validated BC edges to full physical blocks. | All five authored Windows copy tests passed, including GPU-produced input, guard bytes, partial pixels, reverse-recorded producer/consumer lists, compressed small mips and selected depth/stencil planes. The BC regression also passed on both compared WARP versions. Title verification remains required. |
 | GPU-produced constants and raw copies | Stage unaligned root CBVs and table CBVs from their GPU shadows at each use; reuse stable descriptors while refreshing their contents in command order. Route the console raw-address copy command through GPU buffer copies. | Authored native fixtures check root/table shader reads, repeated draws and submissions, reverse-recorded lists, overlap, padding and invalid ranges. The strict Windows gate requires these tests; title verification remains separate. |
+| Rectangle expansion | Expand rectangle vertex inputs on the GPU after earlier producers, then restore graphics state before drawing. Preserve original vertex ordering, formats, packed strides and overlapping element order. | Required native fixtures compare authored output with the existing CPU reference, including raw-copy producers, list ordering and replay. The fourth corner is still interpolated from inputs rather than vertex-shader outputs; native floating-point denormal/NaN behavior can differ from the CPU reference. |
 | Byte/halfword shared memory | Lower 14 LDS subword instructions, including signed reads and d16 half-register preservation; use atomic word updates/reads so neighboring byte writers do not race. | All 168 synthetic containers passed independent DXV validation. The mandatory Windows test executed all 496 dispatch cases per adapter, including cross-wave neighboring fields, on both compared WARP versions. Physical GPU/title verification remains required. |
 | Single-dword shared-memory bounds | Guard 32-bit LDS reads, writes and supported atomics before forming a memory pointer; out-of-range reads return zero, writes are dropped and inactive destinations remain unchanged. Lower subtraction as atomic addition of the wrapping negated operand and invalidate older generated shader caches. | Independent DXIL validation and required native result tests cover valid edges, out-of-range addresses, inactive lanes and atomic returned values. Multi-dword boundary/alignment modes remain outside this change. |
 | CPU fence waits and submission errors | Implement blocking null-event fence waits with completion retained across later fence rewinds. Stop on native signal/event/wait failure before copying GPU data back to the CPU. | Threaded tests cover registration races, independent targets and rewinds. Normal native tests exercise successful submissions; injected native synchronization failures have not been executed. |
@@ -40,7 +41,10 @@ forbids `atomicrmw sub` for groupshared memory. Subtraction now uses one atomic
 add with a wrapping negated operand, matching an authored official-DXC
 reference and retaining all 552 semantic cases. See
 [the initial failing run](https://github.com/Fink692/VIctory/actions/runs/45469493365)
-and the current PR workflow for the native result after that correction.
+and [the passing corrected run](https://github.com/Fink692/VIctory/actions/runs/45472387510),
+which executed all 552 cases and passed the concurrent suite three times.
+The later rectangle expansion change still requires its own complete current
+workflow result.
 
 The first hosted Windows run confirmed the required query/indirect checks
 but exposed an access violation in the larger shader suite. That finding
@@ -77,9 +81,10 @@ comparison alone did not run the entire workspace on the newer runtime.
 The buffer-state work covers known vertex/index, descriptor/root-buffer,
 indirect, query and buffer/texture-copy paths. It does not establish arbitrary
 bindless-buffer correctness or coherence between separate shadows of
-overlapping title memory. CPU-expanded geometry still needs separate work
-when its input is produced by the GPU. Unaligned root and table constants now
-use GPU-ordered staging. A known simultaneous read/UAV binding of one host buffer is
+overlapping title memory. Rectangle input expansion and unaligned root/table constants now consume
+GPU-ordered data. Rectangle interpolation still assumes a vertex shader
+linear in its inputs; arbitrary vertex-shader output interpolation and
+indexed rectangles remain open. A known simultaneous read/UAV binding of one host buffer is
 rejected explicitly; implementing legal aliasing for those passes remains
 open. Cross-queue `Wait` dependencies are also still unimplemented; the new
 CPU fence wait does not provide asynchronous queue scheduling.

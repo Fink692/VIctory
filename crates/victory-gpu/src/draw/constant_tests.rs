@@ -110,7 +110,12 @@ impl TitleBuffer {
     }
 
     fn set(&mut self, offset: usize, words: [u32; 4]) {
-        for (bytes, word) in self.0[offset..offset + 16].chunks_exact_mut(4).zip(words) {
+        for (bytes, word) in self.0[offset..offset + 16]
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(words)
+        {
             bytes.copy_from_slice(&word.to_le_bytes());
         }
     }

@@ -933,14 +933,37 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let rects = self.topology == RECTANGLES;
-        let ran = self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first));
-        if ran {
-            // Rectangles were expanded into their own vertex buffers.
-            let (count, from) = if rects {
-                (vertices / 3 * 6, 0)
-            } else {
-                (vertices, first)
+        if rects && vertices < 3 {
+            return;
+        }
+        let count = if rects {
+            let Some(count) = (vertices / 3).checked_mul(6) else {
+                once!(vertices, "expanded rectangle vertex count overflows");
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                dropped(self.pipeline);
+                return;
             };
+            count
+        } else {
+            vertices
+        };
+        // Expansion uses an internal compute pipeline. Run it before
+        // graphics preparation, then replace just the expanded IA views.
+        let expanded = if rects {
+            self.rectangles(list, vertices, first)
+        } else {
+            Some(Vec::new())
+        };
+        let ran = expanded.is_some() && self.prepare(list, false);
+        if ran {
+            for (slot, view) in expanded.unwrap_or_default() {
+                // SAFETY: expansion retained each buffer in the list's
+                // state map and left it ready for vertex reads.
+                unsafe { list.list.IASetVertexBuffers(slot, Some(&[view])) };
+            }
+            // Rectangles were expanded into their own vertex buffers.
+            let from = if rects { 0 } else { first };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
             // SAFETY: an open list with everything set.
@@ -957,13 +980,24 @@ impl State {
         }
     }
 
-    /// Binds vertex buffers holding the rectangles of vertices `first..first
-    /// + count` as triangles, made when the list is submitted.
-    fn rectangles(&self, list: &HostList, count: u32, first: u32) -> bool {
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
-            return false;
-        };
-        let rects = u64::from(count / 3);
+    /// Expands rectangle vertices on the GPU at their actual command
+    /// position; returned views replace the originals after prepare.
+    fn rectangles(
+        &mut self,
+        list: &HostList,
+        count: u32,
+        first: u32,
+    ) -> Option<Vec<(u32, D3D12_VERTEX_BUFFER_VIEW)>> {
+        #[cfg(feature = "diagnostics")]
+        if crate::pipeline::is_skipped(self.pipeline as This) {
+            return None;
+        }
+        let p = crate::pipeline::host_pipeline(self.pipeline as This)?;
+        if p.compute || p.mesh {
+            once!("rectangle draw has a non-vertex pipeline");
+            return None;
+        }
+        let mut expanded = Vec::new();
         for slot in 0..32 {
             let elements: Vec<(u32, u32)> = p
                 .inputs
@@ -975,41 +1009,25 @@ impl State {
                 continue;
             }
             let v = self.vertex[slot as usize];
-            let stride = u64::from(v.stride);
-            let from = v.address + u64::from(first) * stride;
-            if v.address == 0
-                || stride == 0
-                || u64::from(first + count) * stride > u64::from(v.size)
-                || crate::shadow::find(from, rects * 3 * stride).is_none()
-            {
-                once!(slot, "rectangle vertices outside their buffer");
-                return false;
+            // Invalidate even if a later slot fails: an earlier expansion
+            // may already have replaced native compute/PSO state.
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+            match crate::primitive::gpu::expand(
+                list, v.address, count, first, v.size, v.stride, &elements,
+            ) {
+                Ok(Some(output)) => {
+                    list.keep(&output.buffer);
+                    expanded.push((slot, output.view));
+                }
+                Ok(None) => {}
+                Err(reason) => {
+                    once!(slot, reason, "rectangle expansion refused");
+                    return None;
+                }
             }
-            let Some((gpu, to)) = list.scratch(rects * 6 * stride) else {
-                return false;
-            };
-            let (from, to, stride) = (from as usize, to as usize, stride as usize);
-            let n = rects as usize;
-            list.defer_host(move || {
-                // SAFETY: the vertices lie in a title buffer (checked when
-                // recorded) and the scratch memory is the list's.
-                let (src, dst) = unsafe {
-                    (
-                        std::slice::from_raw_parts(from as *const u8, n * 3 * stride),
-                        std::slice::from_raw_parts_mut(to as *mut u8, n * 6 * stride),
-                    )
-                };
-                crate::primitive::expand_rects(src, dst, stride, &elements);
-            });
-            let view = D3D12_VERTEX_BUFFER_VIEW {
-                BufferLocation: gpu,
-                SizeInBytes: (rects * 6 * stride as u64) as u32,
-                StrideInBytes: v.stride,
-            };
-            // SAFETY: an open list; the view names live scratch memory.
-            unsafe { list.list.IASetVertexBuffers(slot, Some(&[view])) };
         }
-        true
+        Some(expanded)
     }
 
     pub(crate) fn draw_indexed(

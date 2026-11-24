@@ -177,6 +177,20 @@ fn pipeline<'a>(this: This) -> &'a Pipeline {
     unsafe { &*this.cast::<Pipeline>() }
 }
 
+/// Wrap an authored native pipeline so integration fixtures can exercise
+/// the title-facing setters and draw/dispatch state without title shaders.
+#[cfg(all(test, windows))]
+pub(crate) fn from_host_for_test(host: host::HostPipeline) -> This {
+    Box::into_raw(Box::new(Pipeline {
+        object: Object::new(&FUNCTIONS),
+        packet: [0; 8],
+        shaders: Vec::new(),
+        bound: std::sync::atomic::AtomicBool::new(false),
+        host: Arc::new(make::Pending::from_host_for_test(host)),
+    }))
+    .cast()
+}
+
 /// List method: logs each pipeline's shaders the first time a list binds
 /// it, so a run lists the shaders its frames need first.
 pub(crate) fn bound(this: This) {

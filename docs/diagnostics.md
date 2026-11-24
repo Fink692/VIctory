@@ -99,6 +99,15 @@ registration, independent targets and fence rewinds. Native submission
 failures stop before readback; the gate does not inject signal or event
 failures to test those terminating branches.
 
+The rectangle gate requires 24 native cases. It consumes raw GPU copies and
+checks expanded vertex bytes,
+packed formats, range checks, command-list ordering and replay against authored
+inputs. It also checks graphics/compute state restoration around the internal
+expansion dispatch. Native debug errors and incomplete coverage fail the gate.
+The existing input-based fourth-corner interpolation remains a shortcut for
+linear vertex shaders; native floating-point denormal/NaN behavior is not a
+bit-for-bit CPU arithmetic guarantee.
+
 It saves a `checks.json` report and individual process logs under a unique
 directory in the system temporary folder. `-OutputRoot D:\victory-runs`
 selects another external directory. Omitting `-RequireGpu` permits the

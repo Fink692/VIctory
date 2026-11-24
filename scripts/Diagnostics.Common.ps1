@@ -262,6 +262,18 @@ function Get-VictoryConstantCoverage {
     return [ordered]@{ status = 'executed'; cases = $ExpectedCases; validation_errors = 0 }
 }
 
+function Get-VictoryRectangleCoverage {
+    param([Parameter(Mandatory)][string]$Output, [Parameter(Mandatory)][uint32]$ExpectedCases)
+    $results = [regex]::Matches($Output, '(?m)^VICTORY_RECTANGLE_RESULT=.*\r?$')
+    $coverageMatches = [regex]::Matches($Output, '(?m)^VICTORY_RECTANGLE_RESULT=executed cases=(\d+) validation_errors=(\d+)\r?$')
+    if ($ExpectedCases -eq 0 -or $results.Count -ne 1 -or $coverageMatches.Count -ne 1 -or
+        [uint64]$coverageMatches[0].Groups[1].Value -ne $ExpectedCases -or
+        [uint64]$coverageMatches[0].Groups[2].Value -ne 0) {
+        throw "Rectangle expansion must execute all $ExpectedCases expected cases with zero native validation errors."
+    }
+    return [ordered]@{ status = 'executed'; cases = $ExpectedCases; validation_errors = 0 }
+}
+
 function Get-VictoryMemoryCopyCoverage {
     param([Parameter(Mandatory)][string]$Output)
     $coverageMatches = [regex]::Matches($Output, '(?m)^VICTORY_MEMORY_COPY_RESULT=executed cases=(\d+)\r?$')

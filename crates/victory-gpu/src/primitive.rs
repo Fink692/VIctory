@@ -3,7 +3,8 @@
 //! the hardware adds the fourth at `v0 + v2 - v1` (Grand Theft Auto VI's
 //! full-screen rectangles come as top left, bottom left, bottom right); on
 //! the host each rectangle becomes two triangles, with the fourth vertex
-//! made from the other three on the CPU.
+//! made from the other three by [`gpu`] before its draw. The CPU expansion
+//! is retained as an authored-fixture reference.
 //!
 //! shortcut: the fourth vertex is computed from vertex inputs, not from
 //! vertex shader outputs as the hardware does; that is the same for vertex
@@ -11,10 +12,16 @@
 //! [`components`] does not know keep the first vertex's value, and so do
 //! components past the end of the vertex (an element that reaches into the
 //! next one, which the layout allows).
+//! Interpolated floating-point values follow native shader arithmetic:
+//! FP32 denormals may flush and NaN payloads need not match the CPU reference.
+//! Copied vertex bytes retain their original bit patterns.
+
+pub(crate) mod gpu;
 
 /// Expands `rects` rectangles of `stride`-byte vertices from `src` into six
 /// vertices each in `dst`: `(v0, v1, v2)` and `(v0, v2, v3)`, so both
 /// triangles turn the same way. `elements` are (byte offset, format).
+#[cfg(test)]
 pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: &[(u32, u32)]) {
     for (rect, out) in src
         .chunks_exact(3 * stride)
@@ -77,6 +84,7 @@ impl Kind {
         }
     }
 
+    #[cfg(test)]
     fn read(self, at: &[u8], c: usize) -> f32 {
         let b = &at[c * self.bytes()..];
         match self {
@@ -87,6 +95,7 @@ impl Kind {
         }
     }
 
+    #[cfg(test)]
     fn write(self, at: &mut [u8], c: usize, v: f32) {
         let n = self.bytes();
         let b = &mut at[c * n..(c + 1) * n];
@@ -101,6 +110,7 @@ impl Kind {
     }
 }
 
+#[cfg(test)]
 fn half_to_f32(h: u16) -> f32 {
     let sign = u32::from(h >> 15) << 31;
     let exp = u32::from((h >> 10) & 0x1f);
@@ -118,6 +128,7 @@ fn half_to_f32(h: u16) -> f32 {
     f32::from_bits(bits)
 }
 
+#[cfg(test)]
 fn f32_to_half(v: f32) -> u16 {
     let bits = v.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
