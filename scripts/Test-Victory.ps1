@@ -46,7 +46,7 @@ $summary = [ordered]@{
 }
 
 function Invoke-Check {
-    param([string]$Name, [string]$Executable, [string[]]$Arguments, [switch]$MustRunOneTest, [switch]$MustValidateAtomicMatrix, [switch]$OptionalAtomicSemantics, [switch]$MustValidateLdsMatrix, [switch]$MustExecuteLds, [switch]$OptionalDepthBounds, [switch]$MustMatchShaderHash, [switch]$MustValidateLdsDword, [switch]$MustExecuteLdsDword, [switch]$MustExecuteMemoryCopy, [uint32]$ConstantCases = 0, [uint32]$RectangleCases = 0, [hashtable]$EnvironmentOverrides = @{})
+    param([string]$Name, [string]$Executable, [string[]]$Arguments, [switch]$MustRunOneTest, [switch]$MustValidateAtomicMatrix, [switch]$OptionalAtomicSemantics, [switch]$MustValidateLdsMatrix, [switch]$MustExecuteLds, [switch]$OptionalDepthBounds, [switch]$MustMatchShaderHash, [switch]$MustValidateLdsDword, [switch]$MustExecuteLdsDword, [switch]$MustExecuteMemoryCopy, [switch]$MustExecuteWaterfall, [switch]$MustExecuteSampleOffsets, [switch]$MustExecuteDescriptorExhaustion, [uint32]$ConstantCases = 0, [uint32]$RectangleCases = 0, [hashtable]$EnvironmentOverrides = @{})
     Write-Host "Checking $Name..."
     $checkEnvironment = $environment.Clone()
     foreach ($key in $EnvironmentOverrides.Keys) { $checkEnvironment[$key] = $EnvironmentOverrides[$key] }
@@ -56,7 +56,7 @@ function Invoke-Check {
     $checks.Add($check)
     try {
         Assert-VictoryProcessSucceeded $result $Name
-        if ($MustRunOneTest -or $MustValidateAtomicMatrix -or $OptionalAtomicSemantics -or $MustValidateLdsMatrix -or $MustExecuteLds -or $OptionalDepthBounds -or $MustMatchShaderHash -or $MustValidateLdsDword -or $MustExecuteLdsDword -or $MustExecuteMemoryCopy -or $ConstantCases -gt 0 -or $RectangleCases -gt 0) {
+        if ($MustRunOneTest -or $MustValidateAtomicMatrix -or $OptionalAtomicSemantics -or $MustValidateLdsMatrix -or $MustExecuteLds -or $OptionalDepthBounds -or $MustMatchShaderHash -or $MustValidateLdsDword -or $MustExecuteLdsDword -or $MustExecuteMemoryCopy -or $MustExecuteWaterfall -or $MustExecuteSampleOffsets -or $MustExecuteDescriptorExhaustion -or $ConstantCases -gt 0 -or $RectangleCases -gt 0) {
             $output = (Get-Content -LiteralPath $result.stdout_log -Raw) + (Get-Content -LiteralPath $result.stderr_log -Raw)
             if ($output -notmatch 'test result: ok\. 1 passed;' -or ($MustRunOneTest -and $output -match '; skipped')) {
                 throw "$Name did not run its required test successfully. See $($result.stdout_log)."
@@ -68,6 +68,9 @@ function Invoke-Check {
             if ($MustValidateLdsDword) { $check['coverage'] = Get-VictoryLdsDwordValidationCoverage $output }
             if ($MustExecuteLdsDword) { $check['coverage'] = Get-VictoryLdsDwordCoverage $output }
             if ($MustExecuteMemoryCopy) { $check['coverage'] = Get-VictoryMemoryCopyCoverage $output }
+            if ($MustExecuteWaterfall) { $check['coverage'] = Get-VictoryWaterfallCoverage $output }
+            if ($MustExecuteSampleOffsets) { $check['coverage'] = Get-VictorySampleOffsetCoverage $output }
+            if ($MustExecuteDescriptorExhaustion) { $check['coverage'] = Get-VictoryDescriptorExhaustionCoverage $output }
             if ($ConstantCases -gt 0) { $check['coverage'] = Get-VictoryConstantCoverage $output $ConstantCases }
             if ($RectangleCases -gt 0) { $check['coverage'] = Get-VictoryRectangleCoverage $output $RectangleCases }
             if ($OptionalDepthBounds) {
@@ -115,6 +118,8 @@ try {
         Invoke-Check 'atomic-dxil-validator' 'cargo' @('test', '--locked', '-p', 'victory-shader', '--all-features', 'emit::atomic_tests::image_atomics_translate_in_both_widths_and_return_modes', '--', '--exact', '--nocapture') -MustRunOneTest -MustValidateAtomicMatrix
         $compiler = Join-Path (Split-Path $validator -Parent) 'dxc.exe'
         Invoke-Check 'shader-hash-reference' 'cargo' @('test', '--locked', '-p', 'victory-shader', '--all-features', 'emit::container::tests::shader_hash_matches_official_dxc', '--', '--ignored', '--exact', '--nocapture') -MustRunOneTest -MustMatchShaderHash -EnvironmentOverrides @{ VICTORY_DXC = $compiler }
+        Invoke-Check 'texture-sample-offsets' 'cargo' @('test', '--locked', '-p', 'victory-shader', '--all-features', 'emit::image_tests::constant_sample_offsets_read_the_expected_texels', '--', '--exact', '--nocapture') -MustRunOneTest -MustExecuteSampleOffsets
+        Invoke-Check 'waterfall-descriptors' 'cargo' @('test', '--locked', '-p', 'victory-shader', '--all-features', 'emit::waterfall_tests::waterfall_descriptor_selection_matches_each_lane', '--', '--exact', '--nocapture') -MustRunOneTest -MustExecuteWaterfall
         Invoke-Check 'warp-pipeline' 'cargo' @('test', '--locked', '-p', 'victory-shader', '--all-features', 'emit::tests::stub_pipeline_is_created', '--', '--exact', '--nocapture') -MustRunOneTest
         Invoke-Check 'atomic64-unguarded-semantics' 'cargo' @('test', '--locked', '-p', 'victory-shader', '--all-features', 'emit::atomic_tests::image_atomic64_results_match_integer_semantics', '--', '--exact', '--nocapture') -OptionalAtomicSemantics -EnvironmentOverrides @{ VICTORY_D3D12_DEBUG = '1' }
         Invoke-Check 'atomic64-guarded-semantics' 'cargo' @('test', '--locked', '-p', 'victory-shader', '--all-features', 'emit::atomic_tests::guarded_image_atomic64_results_match_integer_semantics', '--', '--exact', '--nocapture') -OptionalAtomicSemantics -EnvironmentOverrides @{ VICTORY_D3D12_DEBUG = '1' }
@@ -135,6 +140,7 @@ try {
         Invoke-Check 'warp-memory-copy' 'cargo' @('test', '--locked', '-p', 'victory-gpu', '--all-features', 'list::memory_copy_tests::raw_memory_copies_observe_gpu_writes_and_preserve_guards', '--', '--ignored', '--exact', '--nocapture') -MustRunOneTest -MustExecuteMemoryCopy -EnvironmentOverrides @{ VICTORY_D3D12_DEBUG = '1' }
         Invoke-Check 'warp-constant-data' 'cargo' @('test', '--locked', '-p', 'victory-gpu', '--all-features', 'draw::constant_tests::constant_buffers_follow_gpu_writes_and_table_reuse', '--', '--ignored', '--exact', '--nocapture') -MustRunOneTest -ConstantCases 24 -EnvironmentOverrides @{ VICTORY_D3D12_DEBUG = '1' }
         Invoke-Check 'warp-constant-lists' 'cargo' @('test', '--locked', '-p', 'victory-gpu', '--all-features', 'draw::constant_tests::constant_buffers_follow_submission_order_and_reexecute', '--', '--ignored', '--exact', '--nocapture') -MustRunOneTest -ConstantCases 10 -EnvironmentOverrides @{ VICTORY_D3D12_DEBUG = '1' }
+        Invoke-Check 'warp-descriptor-exhaustion' 'cargo' @('test', '--locked', '-p', 'victory-gpu', '--all-features', 'draw::constant_tests::exhausted_constant_tables_drop_dispatches_and_recover', '--', '--ignored', '--exact', '--nocapture') -MustRunOneTest -MustExecuteDescriptorExhaustion -EnvironmentOverrides @{ VICTORY_D3D12_DEBUG = '1' }
         Invoke-Check 'warp-rectangle-data' 'cargo' @('test', '--locked', '-p', 'victory-gpu', '--all-features', 'primitive::gpu::tests::gpu_rectangles_observe_copies_formats_and_rebind_draw_state', '--', '--ignored', '--exact', '--nocapture') -MustRunOneTest -RectangleCases 24 -EnvironmentOverrides @{ VICTORY_D3D12_DEBUG = '1' }
         Invoke-Check 'warp-query-results' 'cargo' @('test', '--locked', '-p', 'victory-gpu', '--all-features', 'query::tests::timestamp_queries_execute_and_preserve_destination_guards', '--', '--ignored', '--exact', '--nocapture') -MustRunOneTest
         Invoke-Check 'warp-empty-queries' 'cargo' @('test', '--locked', '-p', 'victory-gpu', '--all-features', 'query::tests::empty_occlusion_and_pipeline_queries_return_measured_zeroes', '--', '--ignored', '--exact', '--nocapture') -MustRunOneTest

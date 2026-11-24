@@ -400,9 +400,19 @@ uint encode_half(float value) {
     int exponent = (int)((bits >> 23u) & 255u) - 112;
     uint mantissa = bits & 0x7fffffu;
     if (exponent >= 31) return sign | 0x7c00u;
-    if (exponent <= 0) return sign;
-    // Preserve the existing conversion's OR/carry and underflow behavior.
-    return sign | ((uint)exponent << 10u) | ((mantissa + 0x1000u) >> 13u);
+    if (exponent <= 0) {
+        if (exponent < -10) return sign;
+        uint significand = 0x800000u | mantissa;
+        uint shift = (uint)(14 - exponent);
+        uint halfway = 1u << (shift - 1u);
+        uint quotient = significand >> shift;
+        uint remainder = significand & ((1u << shift) - 1u);
+        uint rounded = quotient + (uint)(remainder > halfway ||
+            (remainder == halfway && (quotient & 1u) != 0u));
+        return sign | rounded;
+    }
+    // Addition carries a rounded mantissa into the exponent.
+    return sign | (((uint)exponent << 10u) + ((mantissa + 0x1000u) >> 13u));
 }
 float source_value(uint at, uint kind) {
     if (kind == 0u) return asfloat(source_bits(at, 4u));

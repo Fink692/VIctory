@@ -216,7 +216,7 @@ fn build(read: Read, high: bool, offset: u16, layout: Layout, wave64: bool) -> H
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
     let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
-    let res = resource::track(&p, &native.layout, native.stage).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
     let io = io::raise(&p, &native).unwrap();
     let st = structure::structure(&p).unwrap();
     let out = lower::lower(&lower::Parts {

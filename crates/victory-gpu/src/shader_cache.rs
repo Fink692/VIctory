@@ -23,7 +23,8 @@ static MISSES: AtomicU64 = AtomicU64::new(0);
 
 // Version 4 bounds single-dword LDS reads, writes and atomics before access.
 // The executable fingerprint also invalidates any rebuilt emitter.
-const CACHE_VERSION: u32 = 4;
+// Selective upstream shader semantics and resource metadata improvements.
+const CACHE_VERSION: u32 = 5;
 
 /// Keeps translated shaders in `dir` from now on.
 pub fn use_shader_cache(dir: PathBuf) {

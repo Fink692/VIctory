@@ -142,7 +142,7 @@ g
         # from the older concurrent VALU cases. Their results cannot erase a
         # failed full-suite run, and neither control serializes the suite.
         Invoke-NativeShaderRun -Label 'isolated-lds' -TestArguments @('emit::lds_tests::lds_subword_results_preserve_adjacent_bytes', '--exact') -ExpectedTests 1 -RequireLdsCoverage
-        Invoke-NativeShaderRun -Label 'isolated-valu' -TestArguments @('emit::valu_tests::') -ExpectedTests 7
+        Invoke-NativeShaderRun -Label 'isolated-valu' -TestArguments @('emit::valu_tests::') -ExpectedTests 13
         throw "Native shader runs failed: $($failures -join ', '). See each run's logs."
     }
     $summary.status = 'passed'

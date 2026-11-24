@@ -166,7 +166,7 @@ fn build(
 ) -> Result<HostShader, ShaderError> {
     let native = program(op, wide, glc, guarded, mask);
     let p = ir::build(&native.code, native.wave64, native.vgprs)?;
-    let res = resource::track(&p, &native.layout, native.stage)?;
+    let res = resource::track(&p, &native.layout, native.stage, None)?;
     let io = io::raise(&p, &native)?;
     let st = structure::structure(&p)?;
     let l = lower::lower(&lower::Parts {

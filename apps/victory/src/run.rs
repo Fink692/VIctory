@@ -30,6 +30,10 @@ pub fn run(
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = victory_loader::load(&prepared, &images)?;
+    // The mapped image owns its loader metadata; the source and patched file
+    // buffers are no longer needed once the host loader has mapped the cache file.
+    drop(prepared);
+    drop(original);
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
     println!(

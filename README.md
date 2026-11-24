@@ -142,6 +142,8 @@ pwsh -NoProfile -File scripts/Test-Victory.ps1 -RequireGpu
 The [diagnostics guide](docs/diagnostics.md) covers bounded WARP runs,
 shader reports, independent save/cache directories, Series X/S comparisons
 and the evidence required before claiming a visible world or a speedup.
+The [fork comparison](docs/fork-comparison.md) records selected upstream
+improvements, direct component benchmarks, regression evidence and attribution.
 
 | Variable | Effect |
 |----------|--------|
@@ -158,6 +160,7 @@ and the evidence required before claiming a visible world or a speedup.
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
+| `VICTORY_PIPELINE_WAIT_MS=<n>` | shared pipeline-compilation wait allowance per frame in milliseconds (default 500; 0 queues work without waiting) |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |

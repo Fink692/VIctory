@@ -551,7 +551,10 @@ fn analyze(
     };
     t.translated += 1;
     t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
-    let res = match resource::track(&program, &p.layout, p.stage) {
+    // Per-lane descriptor joins need the lane conditions before resources
+    // are traced; preserve the existing report ordering below.
+    let structure_result = structure::structure(&program);
+    let res = match resource::track(&program, &p.layout, p.stage, structure_result.as_ref().ok()) {
         Ok(r) => {
             tally_resources(p, &r, t);
             Some(r)
@@ -588,7 +591,7 @@ fn analyze(
         );
         None
     };
-    let structured = match structure::structure(&program) {
+    let structured = match structure_result {
         Ok(s) => {
             tally_structured(&program, &s, t);
             Some(s)
@@ -768,7 +771,7 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
     let mut traced = HashSet::new();
     for leaf in r.descriptors.iter().flat_map(|d| d.source.leaves()) {
         let a = match *leaf {
-            resource::Source::Loaded { load, .. } => {
+            resource::Source::Loaded { load, .. } | resource::Source::Fetched { load, .. } => {
                 t.loaded += 1;
                 address(load)
             }
@@ -781,7 +784,10 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
                 t.constant += 1;
                 None
             }
-            resource::Source::Phi { .. } => unreachable!("leaves are no phis"),
+            resource::Source::Phi { .. }
+            | resource::Source::Select { .. }
+            | resource::Source::Lanes { .. }
+            | resource::Source::LanePhi { .. } => unreachable!("leaves are no joins"),
         };
         // Heaps hold dynamic resources, which no used entry lists; code
         // tables are no root parameter.
