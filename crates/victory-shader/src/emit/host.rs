@@ -66,6 +66,23 @@ impl Host {
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+        // Match the runtime's diagnostic switch. Configure this before any
+        // test device exists; enabling the layer after device creation is
+        // invalid. Parallel tests may initialize separate Host wrappers.
+        static DEBUG_CONFIGURED: std::sync::Once = std::sync::Once::new();
+        DEBUG_CONFIGURED.call_once(|| {
+            if std::env::var_os("VICTORY_D3D12_DEBUG").is_some() {
+                // SAFETY: the optional debug interface is used synchronously,
+                // before the first device is created in this host harness.
+                unsafe {
+                    let mut layer: Option<ID3D12Debug> = None;
+                    match D3D12GetDebugInterface(&mut layer) {
+                        Ok(()) => layer.iter().for_each(|l| l.EnableDebugLayer()),
+                        Err(e) => eprintln!("D3D12 debug layer unavailable: {e}"),
+                    }
+                }
+            }
+        });
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {
             let mut device: Option<ID3D12Device> = None;
@@ -232,8 +249,87 @@ impl Host {
             },
             ..Default::default()
         };
+        let messages = self.device.cast::<ID3D12InfoQueue>().ok();
+        // SAFETY: the queried queue is a live device interface.
+        let first_message = messages
+            .as_ref()
+            .map_or(0, |q| unsafe { q.GetNumStoredMessages() });
         // SAFETY: the description points at live data.
-        unsafe { self.device.CreateComputePipelineState(&desc) }.map_err(err)
+        unsafe { self.device.CreateComputePipelineState(&desc) }.map_err(|error| {
+            self.compute_pipeline_error(error, cs, messages.as_ref(), first_message)
+        })
+    }
+
+    fn compute_pipeline_error(
+        &self,
+        error: windows::core::Error,
+        cs: &[u8],
+        messages: Option<&ID3D12InfoQueue>,
+        first_message: u64,
+    ) -> String {
+        use std::fmt::Write;
+        let mut text = format!(
+            "CreateComputePipelineState failed ({:#010x}): {error}",
+            error.code().0 as u32
+        );
+        let mut caps = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: the feature structure and message storage have the sizes
+        // specified by their corresponding D3D12 APIs and remain live.
+        unsafe {
+            if self
+                .device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut caps).cast(),
+                    size_of_val(&caps) as u32,
+                )
+                .is_ok()
+            {
+                let _ = write!(
+                    text,
+                    "; shader wave size={:?}, adapter WaveOps={}, wave range={}..={}",
+                    super::required_wave_size(cs),
+                    caps.WaveOps.as_bool(),
+                    caps.WaveLaneCountMin,
+                    caps.WaveLaneCountMax
+                );
+            }
+            if let Some(queue) = messages {
+                let end = queue
+                    .GetNumStoredMessages()
+                    .min(first_message.saturating_add(32));
+                for index in first_message..end {
+                    let mut size = 0;
+                    if queue.GetMessage(index, None, &mut size).is_err()
+                        || size < size_of::<D3D12_MESSAGE>()
+                    {
+                        continue;
+                    }
+                    let mut storage = vec![0u64; size.div_ceil(8)];
+                    let message = storage.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                    if queue.GetMessage(index, Some(message), &mut size).is_err() {
+                        continue;
+                    }
+                    let message = &*message;
+                    if message.pDescription.is_null() || message.DescriptionByteLength == 0 {
+                        continue;
+                    }
+                    let bytes = std::slice::from_raw_parts(
+                        message.pDescription,
+                        message.DescriptionByteLength,
+                    );
+                    let description = String::from_utf8_lossy(bytes);
+                    let _ = write!(
+                        text,
+                        "\nD3D12 message {} (severity {}): {}",
+                        message.ID.0,
+                        message.Severity.0,
+                        description.trim_end_matches('\0')
+                    );
+                }
+            }
+        }
+        text
     }
 
     /// A graphics pipeline from a vertex and a pixel shader, with float or

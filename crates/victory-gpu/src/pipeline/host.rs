@@ -283,11 +283,11 @@ pub(crate) struct HostPipeline {
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
-fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
-    static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
+fn refuse(reason: &str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
+    static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !seen.contains(&reason) {
-        seen.push(reason);
+    if !seen.iter().any(|r| r == reason) {
+        seen.push(reason.to_owned());
         tracing::warn!(?shaders, "no host pipeline: {reason} (logged once)");
     }
     None
@@ -335,6 +335,14 @@ impl HostPipeline {
             s.translated()?;
         }
         let host = host()?;
+
+        for (shader, _) in &stages {
+            if let Some(lanes) = shader.translated()?.host.required_wave_size()
+                && let Err(reason) = host.require_wave_size(lanes)
+            {
+                return refuse(&reason, shaders);
+            }
+        }
 
         if stages.iter().any(|(s, _)| {
             s.translated()

@@ -33,12 +33,17 @@ query readback, query-to-copy visibility across command lists and indirect
 budgets. It also runs the workspace tests with all features, checks Clippy,
 builds release and diagnostics executables, and checks the asset policy.
 The 88-container image-atomic validation matrix runs in its own process.
-A separate atomic64 execution test records `coverage.status`, adapter count
-and executed case count in `checks.json`. A capability-based `unsupported`
-result is allowed for that optional test and provides no execution evidence;
-a native crash, missing coverage marker or failed case fails the gate.
-Separate logs distinguish validator failures from semantic execution failures
-before the parallel workspace suite runs.
+Two separate atomic64 execution checks then record `coverage.status`, adapter
+count and executed case count in `checks.json`: unguarded operations and
+guarded operations, each with 352 cases per capable adapter. Guarded execution
+also needs the measured wave-size capability required by the emitted shader.
+An unsupported guarded case does not prevent testing all unguarded operations.
+A capability-based `unsupported` result provides no execution evidence for
+that check; a native crash, missing coverage marker or failed case fails the
+gate. These isolated checks request the D3D12 debug layer and run immediately
+after the basic WARP pipeline check. Their separate logs and flushed phase
+markers distinguish validator, pipeline and dispatch failures before the
+parallel workspace suite runs.
 It saves a `checks.json` report and individual process logs under a unique
 directory in the system temporary folder. `-OutputRoot D:\victory-runs`
 selects another external directory. Omitting `-RequireGpu` permits the

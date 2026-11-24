@@ -12,7 +12,7 @@ evidence; it does not claim that the title is playable.
 | --- | --- | --- |
 | Integer image atomics | Lower 11 operations at 32 and 64 bits, including compare/exchange, signed extrema, returned old values and inactive lanes. Declare the required DXIL/SFI0 features. | Synthetic cases cover width, return behavior and execution guards; all 88 emitted containers passed the official DXC validator. The Windows gate records semantic execution separately from an unsupported adapter. Inspect the tested commit's CI result; no physical-GPU/title execution is claimed. |
 | Resource handles and lane masks | Key cached handles by both resource-property words; declare wave operations when emitting lane-index queries. | Regression tests and independent validation cover the float/integer handle collision and missing feature flag. Atomic resource annotations also follow the canonical output of Microsoft's HLSL compiler. |
-| Capability checks and shader cache | Check actual host int64, typed-atomic and descriptor-heap-atomic capabilities, including shaders loaded from cache. Invalidate old generated shader cache entries. | Windows code cross-compiles. Confirm actual adapter features and behavior from a Windows run. |
+| Capability checks and shader cache | Check actual host int64, typed-atomic, descriptor-heap-atomic and fixed-wave capabilities, including requirements read from cached shader containers. Refuse unsupported wave sizes before pipeline creation and invalidate old generated shader cache entries. | Windows code cross-compiles. Boundary tests cover wave-size support and failed feature queries. Confirm actual adapter features and behavior from a Windows run. |
 | GPU queries and ordering | Allocate host query heaps, record begin/end/resolve operations, preserve query lifetime through submission, track host buffer states and perform buffer copies on the GPU. Use the host queue's clock/frequency. | Required hosted Windows/WARP tests passed for timestamp destinations, measured empty occlusion/statistics queries and resolve-to-copy ordering. Physical GPU/title execution remains required. |
 | Indirect execution | Saturate the work budget, honor actual count-buffer values, validate argument/count ranges and transition the count buffer for indirect reads. | CPU boundary tests and the required hosted WARP regression passed for overflow, inactive records and binding conflicts. Physical GPU/title execution remains required. |
 | Shader census | Add deterministic JSON failure groups and per-program runtime-compatible hashes; distinguish emitted, validated and pipeline-created results. Surface scan and check-initialization errors. | CLI tests cover failure gates, unavailable checks, hashes, report serialization and refusing output replacement. Full title inputs are not available in this workspace. |
@@ -28,9 +28,14 @@ Linux as well.
 The first hosted Windows run confirmed the required query/indirect checks
 but exposed an access violation in the larger shader suite. That finding
 led to correcting the atomic resource annotation and adding isolated
-validation/execution checks with explicit coverage markers. A passing
-subset is not a passing workflow; use the current result linked from the
-pull request, including any subsequent fixes.
+validation/execution checks with explicit coverage markers. The next run
+validated all 88 containers and executed the first 16 unguarded cases, then
+rejected the first fixed-wave guarded pipeline. Guarded and unguarded
+execution now have separate 352-case checks; required wave sizes are checked
+against measured device capabilities, and pipeline failures include native
+debug messages when available. A passing subset is not a passing workflow;
+use the current result linked from the pull request, including any subsequent
+fixes and capability-based coverage gaps.
 
 The buffer-state work covers known vertex/index, descriptor/root-buffer,
 indirect, query and buffer-copy paths. It does not establish arbitrary

@@ -303,16 +303,54 @@ fn atomic_requirements_come_from_the_container() {
     assert!(!s.requires_i64_image_atomics());
 }
 
+#[test]
+fn fixed_wave_requirements_come_from_the_container() {
+    let mut shader = build(0x11, true, true, true, None).unwrap();
+    assert_eq!(shader.required_wave_size(), Some(32));
+    assert_eq!(shader.clone().required_wave_size(), Some(32));
+    shader.dxil = build(0x11, true, true, false, None).unwrap().dxil;
+    assert_eq!(shader.required_wave_size(), None);
+
+    // All PSV runtime-info versions start with the same fixed-size wave
+    // range. Neither the rest of HostShader nor fresh lowering supplies it.
+    let mut psv = vec![0; 28];
+    psv[..4].copy_from_slice(&24u32.to_le_bytes());
+    psv[20..24].copy_from_slice(&64u32.to_le_bytes());
+    psv[24..28].copy_from_slice(&64u32.to_le_bytes());
+    shader.dxil = super::container::build(&[(b"PSV0", &psv)]);
+    assert_eq!(shader.required_wave_size(), Some(64));
+    psv[..4].copy_from_slice(&48u32.to_le_bytes());
+    shader.dxil = super::container::build(&[(b"PSV0", &psv)]);
+    assert_eq!(shader.required_wave_size(), None);
+    shader.dxil = vec![0; 16];
+    assert_eq!(shader.required_wave_size(), None);
+}
+
 /// High halves differ and add/sub cross the 32-bit boundary. Compare/swap
 /// exercises success and failure; min/max include opposite signed halves.
 #[cfg(windows)]
 #[test]
 fn image_atomic64_results_match_integer_semantics() {
+    check_image_atomic64_results(false);
+}
+
+#[cfg(windows)]
+#[test]
+fn guarded_image_atomic64_results_match_integer_semantics() {
+    check_image_atomic64_results(true);
+}
+
+#[cfg(windows)]
+fn check_image_atomic64_results(guarded: bool) {
     use super::host::{Dispatch, Host, Root, View};
     use windows::Win32::Graphics::Direct3D12::*;
 
     let mut ran = 0;
     let mut cases_run = 0;
+    let required_wave = build(OPS[0], true, false, guarded, None)
+        .unwrap()
+        .required_wave_size();
+    assert_eq!(required_wave, guarded.then_some(32));
     let adapters: &[(&str, bool)] = if std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1") {
         &[("warp", true)]
     } else {
@@ -359,10 +397,13 @@ fn image_atomic64_results_match_integer_semantics() {
                     .is_ok()
         };
         trace(format_args!(
-            "phase=capabilities adapter={label:?} queried={supported} int64={} typed={} heap={}",
+            "phase=capabilities adapter={label:?} queried={supported} int64={} typed={} heap={} wave_ops={} wave_min={} wave_max={} required_wave={required_wave:?}",
             opt1.Int64ShaderOps.as_bool(),
             opt9.AtomicInt64OnTypedResourceSupported.as_bool(),
-            opt11.AtomicInt64OnDescriptorHeapResourceSupported.as_bool()
+            opt11.AtomicInt64OnDescriptorHeapResourceSupported.as_bool(),
+            opt1.WaveOps.as_bool(),
+            opt1.WaveLaneCountMin,
+            opt1.WaveLaneCountMax
         ));
         if !supported
             || !opt1.Int64ShaderOps.as_bool()
@@ -370,6 +411,19 @@ fn image_atomic64_results_match_integer_semantics() {
             || !opt11.AtomicInt64OnDescriptorHeapResourceSupported.as_bool()
         {
             eprintln!("{label} lacks typed/heap 64-bit atomics; skipped");
+            continue;
+        }
+        if let Some(wave) = required_wave
+            && (!opt1.WaveOps.as_bool()
+                || wave < opt1.WaveLaneCountMin
+                || wave > opt1.WaveLaneCountMax)
+        {
+            eprintln!(
+                "{label} cannot execute the required {wave}-lane guard: WaveOps={}, supported wave range={}..={}; skipped",
+                opt1.WaveOps.as_bool(),
+                opt1.WaveLaneCountMin,
+                opt1.WaveLaneCountMax
+            );
             continue;
         }
         ran += 1;
@@ -381,104 +435,100 @@ fn image_atomic64_results_match_integer_semantics() {
         ];
         for &op in OPS {
             for glc in [false, true] {
-                for guarded in [false, true] {
-                    let shader = build(op, true, glc, guarded, None).unwrap();
-                    trace(format_args!(
-                        "phase=pipeline_begin adapter={label:?} op={op:#x} glc={glc} guarded={guarded}"
-                    ));
-                    let (root, pso) = host
-                        .compute_pipeline(&shader)
-                        .unwrap_or_else(|e| panic!("{label}: {e}"));
-                    trace(format_args!(
-                        "phase=pipeline_end adapter={label:?} op={op:#x} glc={glc} guarded={guarded}"
-                    ));
-                    for &(initial, value) in cases {
-                        for matches in [false, true] {
-                            for active in [false, true] {
-                                let comparison = if matches {
-                                    initial
-                                } else {
-                                    initial ^ (1 << 40)
+                let shader = build(op, true, glc, guarded, None).unwrap();
+                trace(format_args!(
+                    "phase=pipeline_begin adapter={label:?} op={op:#x} glc={glc} guarded={guarded}"
+                ));
+                let (root, pso) = host
+                    .compute_pipeline(&shader)
+                    .unwrap_or_else(|e| panic!("{label}: {e}"));
+                trace(format_args!(
+                    "phase=pipeline_end adapter={label:?} op={op:#x} glc={glc} guarded={guarded}"
+                ));
+                for &(initial, value) in cases {
+                    for matches in [false, true] {
+                        for active in [false, true] {
+                            let comparison = if matches {
+                                initial
+                            } else {
+                                initial ^ (1 << 40)
+                            };
+                            let inputs = [
+                                initial as u32,
+                                (initial >> 32) as u32,
+                                value as u32,
+                                (value >> 32) as u32,
+                                comparison as u32,
+                                (comparison >> 32) as u32,
+                                u32::from(active),
+                                0,
+                            ];
+                            let mut data = vec![0; shader.user_data_dwords() as usize];
+                            for u in &shader.user_data {
+                                data[u.index as usize] = match (u.root, u.slot) {
+                                    (RootType::Constants, 0) => inputs[u.dword as usize],
+                                    (RootType::Table, 1) => 0,
+                                    (RootType::Table, 2) => 32,
+                                    other => panic!("unexpected user data {other:?}"),
                                 };
-                                let inputs = [
-                                    initial as u32,
-                                    (initial >> 32) as u32,
-                                    value as u32,
-                                    (value >> 32) as u32,
-                                    comparison as u32,
-                                    (comparison >> 32) as u32,
-                                    u32::from(active),
-                                    0,
-                                ];
-                                let mut data = vec![0; shader.user_data_dwords() as usize];
-                                for u in &shader.user_data {
-                                    data[u.index as usize] = match (u.root, u.slot) {
-                                        (RootType::Constants, 0) => inputs[u.dword as usize],
-                                        (RootType::Table, 1) => 0,
-                                        (RootType::Table, 2) => 32,
-                                        other => panic!("unexpected user data {other:?}"),
-                                    };
-                                }
-                                trace(format_args!(
-                                    "phase=dispatch_begin adapter={label:?} case={} op={op:#x} initial={initial:#x} value={value:#x} matches={matches} glc={glc} guarded={guarded} active={active}",
-                                    cases_run + 1
-                                ));
-                                let out = host
-                                    .dispatch(
-                                        &root,
-                                        &pso,
-                                        &Dispatch {
-                                            roots: vec![(0, Root::Constants(data))],
-                                            views: &[View::RawUav(4), View::Uint64TextureUav(1, 1)],
-                                            samplers: &[],
-                                            groups: [1, 1, 1],
-                                        },
-                                    )
-                                    .unwrap_or_else(|e| panic!("{label}: {e}"));
-                                trace(format_args!(
-                                    "phase=dispatch_end adapter={label:?} case={}",
-                                    cases_run + 1
-                                ));
-                                let actual_returned =
-                                    u64::from(out[0][0]) | u64::from(out[0][1]) << 32;
-                                let actual_final =
-                                    u64::from(out[0][2]) | u64::from(out[0][3]) << 32;
-                                let expected = if guarded && !active {
-                                    initial
-                                } else {
-                                    match op {
-                                        0x0f => value,
-                                        0x10 => {
-                                            if matches {
-                                                value
-                                            } else {
-                                                initial
-                                            }
-                                        }
-                                        0x11 => initial.wrapping_add(value),
-                                        0x12 => initial.wrapping_sub(value),
-                                        0x14 => (initial as i64).min(value as i64) as u64,
-                                        0x15 => initial.min(value),
-                                        0x16 => (initial as i64).max(value as i64) as u64,
-                                        0x17 => initial.max(value),
-                                        0x18 => initial & value,
-                                        0x19 => initial | value,
-                                        0x1a => initial ^ value,
-                                        _ => unreachable!(),
-                                    }
-                                };
-                                let returned = if glc && (!guarded || active) {
-                                    initial
-                                } else {
-                                    value
-                                };
-                                assert_eq!(
-                                    (actual_returned, actual_final),
-                                    (returned, expected),
-                                    "{label}, op={op:#x}, initial={initial:#x}, value={value:#x}, matches={matches}, glc={glc}, guarded={guarded}, active={active}"
-                                );
-                                cases_run += 1;
                             }
+                            trace(format_args!(
+                                "phase=dispatch_begin adapter={label:?} case={} op={op:#x} initial={initial:#x} value={value:#x} matches={matches} glc={glc} guarded={guarded} active={active}",
+                                cases_run + 1
+                            ));
+                            let out = host
+                                .dispatch(
+                                    &root,
+                                    &pso,
+                                    &Dispatch {
+                                        roots: vec![(0, Root::Constants(data))],
+                                        views: &[View::RawUav(4), View::Uint64TextureUav(1, 1)],
+                                        samplers: &[],
+                                        groups: [1, 1, 1],
+                                    },
+                                )
+                                .unwrap_or_else(|e| panic!("{label}: {e}"));
+                            trace(format_args!(
+                                "phase=dispatch_end adapter={label:?} case={}",
+                                cases_run + 1
+                            ));
+                            let actual_returned = u64::from(out[0][0]) | u64::from(out[0][1]) << 32;
+                            let actual_final = u64::from(out[0][2]) | u64::from(out[0][3]) << 32;
+                            let expected = if guarded && !active {
+                                initial
+                            } else {
+                                match op {
+                                    0x0f => value,
+                                    0x10 => {
+                                        if matches {
+                                            value
+                                        } else {
+                                            initial
+                                        }
+                                    }
+                                    0x11 => initial.wrapping_add(value),
+                                    0x12 => initial.wrapping_sub(value),
+                                    0x14 => (initial as i64).min(value as i64) as u64,
+                                    0x15 => initial.min(value),
+                                    0x16 => (initial as i64).max(value as i64) as u64,
+                                    0x17 => initial.max(value),
+                                    0x18 => initial & value,
+                                    0x19 => initial | value,
+                                    0x1a => initial ^ value,
+                                    _ => unreachable!(),
+                                }
+                            };
+                            let returned = if glc && (!guarded || active) {
+                                initial
+                            } else {
+                                value
+                            };
+                            assert_eq!(
+                                (actual_returned, actual_final),
+                                (returned, expected),
+                                "{label}, op={op:#x}, initial={initial:#x}, value={value:#x}, matches={matches}, glc={glc}, guarded={guarded}, active={active}"
+                            );
+                            cases_run += 1;
                         }
                     }
                 }
@@ -489,7 +539,7 @@ fn image_atomic64_results_match_integer_semantics() {
         eprintln!("64-bit image atomics execution NOT validated: no capable adapter");
         eprintln!("VICTORY_ATOMIC64_RESULT=unsupported adapters=0 cases=0");
     } else {
-        assert_eq!(cases_run, ran * 704);
+        assert_eq!(cases_run, ran * 352);
         eprintln!("VICTORY_ATOMIC64_RESULT=executed adapters={ran} cases={cases_run}");
     }
 }

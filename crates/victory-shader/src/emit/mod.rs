@@ -51,7 +51,8 @@
 //!   resolves) read raw views this way.
 //!
 //! * **Texture atomics**: 32-bit operations use an R32_UINT UAV; 64-bit
-//!   operations use a scalar U64 annotation over an R32G32_UINT UAV. The
+//!   operations use an i64 intrinsic and U32 resource components over an
+//!   R32G32_UINT UAV. The
 //!   latter require Int64ShaderOps and the optional SM 6.6 typed-resource
 //!   and descriptor-heap 64-bit atomic capabilities. No pair of 32-bit
 //!   atomics can substitute for one atomic 64-bit operation. Global loads
@@ -175,6 +176,13 @@ impl HostShader {
             .is_some_and(|features| features & (0x40_0000 | 0x1000_0000) != 0)
     }
 
+    /// A fixed hardware wave size required by the shader, if any. Read the
+    /// PSV0 runtime information so cached containers retain this requirement.
+    /// Ranged wave-size constraints are not emitted by this SM 6.6 compiler.
+    pub fn required_wave_size(&self) -> Option<u32> {
+        required_wave_size(&self.dxil)
+    }
+
     /// Size of the user-data buffer the shader declares, in dwords (a
     /// multiple of 4; 0 when it reads none). Root constants must cover it.
     pub fn user_data_dwords(&self) -> u32 {
@@ -186,6 +194,16 @@ impl HostShader {
             .unwrap_or(0);
         n.next_multiple_of(4)
     }
+}
+
+fn required_wave_size(dxil: &[u8]) -> Option<u32> {
+    let container = Container::parse(dxil).ok()?;
+    let data = container.part(FourCC::PSV0)?.data;
+    let size = u32::from_le_bytes(data.get(..4)?.try_into().ok()?) as usize;
+    let info = data.get(4..4usize.checked_add(size)?)?;
+    let min = u32::from_le_bytes(info.get(16..20)?.try_into().ok()?);
+    let max = u32::from_le_bytes(info.get(20..24)?.try_into().ok()?);
+    (min != 0 && min == max).then_some(min)
 }
 
 /// One dword of user data and the root parameter that fills it.

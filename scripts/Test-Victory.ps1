@@ -37,14 +37,17 @@ $summary = [ordered]@{
     formatting_base = $FormatBaseRef
     formatting_scope = 'Complete changed Rust files; full workspace when rustfmt configuration changes.'
     checks = $checks
-    limitations = @('No game files are executed.', 'Console-SDK differential tests and ignored reference-data tests are not part of this gate.', 'WARP does not establish physical GPU compatibility or world rendering.', 'Optional atomic64 execution may be unsupported; inspect its separate coverage result.')
+    limitations = @('No game files are executed.', 'Console-SDK differential tests and ignored reference-data tests are not part of this gate.', 'WARP does not establish physical GPU compatibility or world rendering.', 'Optional atomic64 execution checks may be unsupported; inspect each coverage result.')
 }
 
 function Invoke-Check {
-    param([string]$Name, [string]$Executable, [string[]]$Arguments, [switch]$MustRunOneTest, [switch]$MustValidateAtomicMatrix, [switch]$OptionalAtomicSemantics)
+    param([string]$Name, [string]$Executable, [string[]]$Arguments, [switch]$MustRunOneTest, [switch]$MustValidateAtomicMatrix, [switch]$OptionalAtomicSemantics, [hashtable]$EnvironmentOverrides = @{})
     Write-Host "Checking $Name..."
-    $result = Invoke-VictoryProcess -Executable $Executable -Arguments $Arguments -WorkingDirectory $script:VictoryRepoRoot -LogPrefix (Join-Path $report $Name) -Environment $environment -TimeoutSeconds 1200
+    $checkEnvironment = $environment.Clone()
+    foreach ($key in $EnvironmentOverrides.Keys) { $checkEnvironment[$key] = $EnvironmentOverrides[$key] }
+    $result = Invoke-VictoryProcess -Executable $Executable -Arguments $Arguments -WorkingDirectory $script:VictoryRepoRoot -LogPrefix (Join-Path $report $Name) -Environment $checkEnvironment -TimeoutSeconds 1200
     $check = [ordered]@{ name = $Name; process = $result }
+    if ($EnvironmentOverrides.Count -gt 0) { $check['environment_overrides'] = $EnvironmentOverrides }
     $checks.Add($check)
     Assert-VictoryProcessSucceeded $result $Name
     if ($MustRunOneTest -or $MustValidateAtomicMatrix -or $OptionalAtomicSemantics) {
@@ -55,7 +58,7 @@ function Invoke-Check {
         if ($MustValidateAtomicMatrix) { $check['coverage'] = Get-VictoryAtomicValidationCoverage $output }
         if ($OptionalAtomicSemantics) {
             $check['coverage'] = Get-VictoryAtomic64Coverage $output
-            Write-Host "Atomic64 execution: $($check.coverage.status); adapters=$($check.coverage.adapters); cases=$($check.coverage.cases)."
+            Write-Host "$Name coverage: $($check.coverage.status); adapters=$($check.coverage.adapters); cases=$($check.coverage.cases)."
         }
     }
 }
@@ -81,11 +84,12 @@ try {
         Invoke-Check 'dxil-validator' 'cargo' @('test', '--locked', '-p', 'victory-shader', '--all-features', 'emit::tests::constant_color_validates', '--', '--exact', '--nocapture') -MustRunOneTest
         Invoke-Check 'atomic-dxil-validator' 'cargo' @('test', '--locked', '-p', 'victory-shader', '--all-features', 'emit::atomic_tests::image_atomics_translate_in_both_widths_and_return_modes', '--', '--exact', '--nocapture') -MustRunOneTest -MustValidateAtomicMatrix
         Invoke-Check 'warp-pipeline' 'cargo' @('test', '--locked', '-p', 'victory-shader', '--all-features', 'emit::tests::stub_pipeline_is_created', '--', '--exact', '--nocapture') -MustRunOneTest
+        Invoke-Check 'atomic64-unguarded-semantics' 'cargo' @('test', '--locked', '-p', 'victory-shader', '--all-features', 'emit::atomic_tests::image_atomic64_results_match_integer_semantics', '--', '--exact', '--nocapture') -OptionalAtomicSemantics -EnvironmentOverrides @{ VICTORY_D3D12_DEBUG = '1' }
+        Invoke-Check 'atomic64-guarded-semantics' 'cargo' @('test', '--locked', '-p', 'victory-shader', '--all-features', 'emit::atomic_tests::guarded_image_atomic64_results_match_integer_semantics', '--', '--exact', '--nocapture') -OptionalAtomicSemantics -EnvironmentOverrides @{ VICTORY_D3D12_DEBUG = '1' }
         Invoke-Check 'warp-query-results' 'cargo' @('test', '--locked', '-p', 'victory-gpu', '--all-features', 'query::tests::timestamp_queries_execute_and_preserve_destination_guards', '--', '--ignored', '--exact', '--nocapture') -MustRunOneTest
         Invoke-Check 'warp-empty-queries' 'cargo' @('test', '--locked', '-p', 'victory-gpu', '--all-features', 'query::tests::empty_occlusion_and_pipeline_queries_return_measured_zeroes', '--', '--ignored', '--exact', '--nocapture') -MustRunOneTest
         Invoke-Check 'warp-query-copies' 'cargo' @('test', '--locked', '-p', 'victory-gpu', '--all-features', 'query::tests::resolved_queries_feed_gpu_copies_across_lists', '--', '--ignored', '--exact', '--nocapture') -MustRunOneTest
         Invoke-Check 'warp-indirect-budget' 'cargo' @('test', '--locked', '-p', 'victory-gpu', '--all-features', 'indirect::tests::indirect_budget_cannot_wrap_and_ignores_inactive_records', '--', '--ignored', '--exact', '--nocapture') -MustRunOneTest
-        Invoke-Check 'atomic64-semantics' 'cargo' @('test', '--locked', '-p', 'victory-shader', '--all-features', 'emit::atomic_tests::image_atomic64_results_match_integer_semantics', '--', '--exact', '--nocapture') -OptionalAtomicSemantics
     }
     Invoke-Check 'workspace-tests' 'cargo' @('test', '--locked', '--workspace', '--all-features', '--', '--nocapture')
     Invoke-Check 'clippy' 'cargo' @('clippy', '--locked', '--workspace', '--all-targets', '--all-features')

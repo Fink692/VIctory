@@ -37,6 +37,7 @@ const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
+    waves: OnceLock<WaveSupport>,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -53,6 +54,38 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
+}
+
+/// OPTIONS1 belongs to this device. Shader model 6.6 alone does not mean
+/// the adapter supports the console shader's fixed wave size.
+#[derive(Clone, Copy)]
+struct WaveSupport {
+    queried: bool,
+    operations: bool,
+    min: u32,
+    max: u32,
+}
+
+impl WaveSupport {
+    fn require(self, lanes: u32) -> Result<(), String> {
+        // SM 6.6 WaveSize accepts powers of two from 4 through 128. The
+        // device's reported bounds are inclusive; WaveOps and a successful
+        // feature query are separate requirements.
+        if self.queried
+            && self.operations
+            && lanes.is_power_of_two()
+            && (4..=128).contains(&lanes)
+            && (self.min..=self.max).contains(&lanes)
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "the host GPU cannot provide required wave size {lanes} \
+                 (OPTIONS1 query succeeded: {}, WaveOps: {}, wave range: {}..={})",
+                self.queried, self.operations, self.min, self.max
+            ))
+        }
+    }
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -217,6 +250,7 @@ fn create() -> windows::core::Result<Host> {
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
+            waves: OnceLock::new(),
             queue,
             fence,
             submitted: Mutex::new(0),
@@ -258,6 +292,78 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_wave_requirements_use_actual_inclusive_capabilities() {
+        let support = WaveSupport {
+            queried: true,
+            operations: true,
+            min: 32,
+            max: 64,
+        };
+        for lanes in [32, 64] {
+            assert!(support.require(lanes).is_ok());
+        }
+        for lanes in [0, 16, 33, 128] {
+            assert!(support.require(lanes).is_err(), "wave size {lanes}");
+        }
+        assert!(WaveSupport { min: 64, ..support }.require(64).is_ok());
+        assert!(WaveSupport { min: 64, ..support }.require(32).is_err());
+        assert!(WaveSupport { max: 32, ..support }.require(64).is_err());
+        assert!(
+            WaveSupport {
+                min: 64,
+                max: 32,
+                ..support
+            }
+            .require(32)
+            .is_err()
+        );
+
+        // A runtime that only reports four lanes must not be treated as
+        // supporting the console's 32/64-lane shaders merely due to SM 6.6.
+        let narrow = WaveSupport {
+            min: 4,
+            max: 4,
+            ..support
+        };
+        assert!(narrow.require(4).is_ok());
+        let reason = narrow.require(32).unwrap_err();
+        assert!(reason.contains("required wave size 32"));
+        assert!(reason.contains("wave range: 4..=4"));
+    }
+
+    #[test]
+    fn wave_requirements_reject_missing_capabilities_and_invalid_sizes() {
+        let support = WaveSupport {
+            queried: true,
+            operations: true,
+            min: 0,
+            max: u32::MAX,
+        };
+        for lanes in [4, 8, 16, 32, 64, 128] {
+            assert!(support.require(lanes).is_ok());
+        }
+        for lanes in [0, 1, 2, 31, 256, u32::MAX] {
+            assert!(support.require(lanes).is_err(), "wave size {lanes}");
+        }
+        assert!(
+            WaveSupport {
+                queried: false,
+                ..support
+            }
+            .require(32)
+            .is_err()
+        );
+        assert!(
+            WaveSupport {
+                operations: false,
+                ..support
+            }
+            .require(32)
+            .is_err()
+        );
+    }
 
     #[test]
     fn warp_adapter_accepts_only_software() {
@@ -447,15 +553,7 @@ impl Host {
                     dedicated_video_bytes = desc.DedicatedVideoMemory,
                     "selected host adapter");
             }
-            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
-            let wave_query = self
-                .device
-                .CheckFeatureSupport(
-                    D3D12_FEATURE_D3D12_OPTIONS1,
-                    (&raw mut options).cast(),
-                    size_of_val(&options) as u32,
-                )
-                .is_ok();
+            let waves = self.wave_support();
             let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
                 HighestShaderModel: D3D_SHADER_MODEL_6_6,
             };
@@ -468,10 +566,10 @@ impl Host {
                 )
                 .is_ok();
             tracing::info!(
-                wave_query,
-                wave_ops = options.WaveOps.as_bool(),
-                wave_min = options.WaveLaneCountMin,
-                wave_max = options.WaveLaneCountMax,
+                wave_query = waves.queried,
+                wave_ops = waves.operations,
+                wave_min = waves.min,
+                wave_max = waves.max,
                 shader_query,
                 shader_model = if shader_query {
                     model.HighestShaderModel.0
@@ -483,6 +581,33 @@ impl Host {
         }
         self.mesh_shaders();
         self.i64_image_atomics();
+    }
+
+    fn wave_support(&self) -> &WaveSupport {
+        self.waves.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            // SAFETY: the query receives its matching writable structure.
+            let queried = unsafe {
+                self.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            }
+            .is_ok();
+            WaveSupport {
+                queried,
+                operations: options.WaveOps.as_bool(),
+                min: options.WaveLaneCountMin,
+                max: options.WaveLaneCountMax,
+            }
+        })
+    }
+
+    /// Reject an unsupported fixed wave size before D3D12 pipeline creation
+    /// loses the requirement behind an opaque E_INVALIDARG error.
+    pub(crate) fn require_wave_size(&self, lanes: u32) -> Result<(), String> {
+        self.wave_support().require(lanes)
     }
 
     /// Query results and bottom-of-pipe GPU timestamps use this clock.
