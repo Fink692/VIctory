@@ -142,3 +142,28 @@ function Assert-VictoryProcessSucceeded {
         throw "$Label failed (exit=$($Result.exit_code), timeout=$($Result.timed_out), error=$($Result.error)). See $($Result.stderr_log) and $($Result.stdout_log)."
     }
 }
+
+function Get-VictoryAtomic64Coverage {
+    param([Parameter(Mandatory)][string]$Output)
+    # The semantic test emits this only after all supported cases complete,
+    # or after an explicit capability check finds no supported adapter.
+    $coverageMatches = [regex]::Matches($Output, '(?m)^VICTORY_ATOMIC64_RESULT=(executed|unsupported) adapters=(\d+) cases=(\d+)\r?$')
+    if ($coverageMatches.Count -ne 1) { throw 'The atomic64 test must report exactly one execution/capability result.' }
+    $status = $coverageMatches[0].Groups[1].Value
+    $adapters = [uint64]$coverageMatches[0].Groups[2].Value
+    $cases = [uint64]$coverageMatches[0].Groups[3].Value
+    if (($status -eq 'executed' -and ($adapters -eq 0 -or $cases -eq 0)) -or
+        ($status -eq 'unsupported' -and ($adapters -ne 0 -or $cases -ne 0))) {
+        throw 'The atomic64 test reported contradictory execution/capability counts.'
+    }
+    return [ordered]@{ status = $status; adapters = $adapters; cases = $cases }
+}
+
+function Get-VictoryAtomicValidationCoverage {
+    param([Parameter(Mandatory)][string]$Output)
+    $coverageMatches = [regex]::Matches($Output, '(?m)^VICTORY_ATOMIC_VALIDATION_RESULT=validated containers=(\d+)\r?$')
+    if ($coverageMatches.Count -ne 1 -or [uint64]$coverageMatches[0].Groups[1].Value -ne 88) {
+        throw 'The atomic validation test must confirm independent validation of all 88 synthetic containers.'
+    }
+    return [ordered]@{ status = 'validated'; containers = 88 }
+}

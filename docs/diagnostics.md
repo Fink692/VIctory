@@ -32,6 +32,13 @@ runs required synthetic DXIL and WARP tests covering pipeline creation,
 query readback, query-to-copy visibility across command lists and indirect
 budgets. It also runs the workspace tests with all features, checks Clippy,
 builds release and diagnostics executables, and checks the asset policy.
+The 88-container image-atomic validation matrix runs in its own process.
+A separate atomic64 execution test records `coverage.status`, adapter count
+and executed case count in `checks.json`. A capability-based `unsupported`
+result is allowed for that optional test and provides no execution evidence;
+a native crash, missing coverage marker or failed case fails the gate.
+Separate logs distinguish validator failures from semantic execution failures
+before the parallel workspace suite runs.
 It saves a `checks.json` report and individual process logs under a unique
 directory in the system temporary folder. `-OutputRoot D:\victory-runs`
 selects another external directory. Omitting `-RequireGpu` permits the

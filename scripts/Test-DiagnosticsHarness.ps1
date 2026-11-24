@@ -56,7 +56,20 @@ exit $ExitCode
     $result = Invoke-VictoryProcess -Executable $pwsh -Arguments @('-NoProfile', '-NonInteractive', '-File', $probe, '-SleepSeconds', '30') -WorkingDirectory $temp -LogPrefix (Join-Path $temp 'timeout') -TimeoutSeconds 1
     Assert-That ($result.timed_out -and $result.duration_ms -lt 15000) 'A long-running child must be stopped at the deadline.'
     Assert-That (Test-Path -LiteralPath (Join-Path $temp 'timeout.process.json')) 'Timeout metadata must be written.'
-    Write-Host 'Diagnostics harness checks passed: external paths, argument quoting, environment isolation, dual-stream capture, nonzero exit, timeout and no overwrite.'
+
+    $coverage = Get-VictoryAtomic64Coverage "test diagnostics`nVICTORY_ATOMIC64_RESULT=executed adapters=1 cases=704`r`n"
+    Assert-That ($coverage.status -eq 'executed' -and $coverage.adapters -eq 1 -and $coverage.cases -eq 704) 'Executed semantic cases must be counted separately from test discovery.'
+    $coverage = Get-VictoryAtomic64Coverage 'VICTORY_ATOMIC64_RESULT=unsupported adapters=0 cases=0'
+    Assert-That ($coverage.status -eq 'unsupported' -and $coverage.cases -eq 0) 'Unsupported atomic64 hardware must not be reported as semantic execution.'
+    Assert-Rejected { Get-VictoryAtomic64Coverage 'test result: ok. 1 passed;' } 'A passing test alone must not claim semantic execution.'
+    Assert-Rejected { Get-VictoryAtomic64Coverage 'VICTORY_ATOMIC64_RESULT=executed adapters=0 cases=0' } 'Executed results need actual adapters and cases.'
+    Assert-Rejected { Get-VictoryAtomic64Coverage 'VICTORY_ATOMIC64_RESULT=unsupported adapters=1 cases=704' } 'Unsupported results cannot claim executed cases.'
+    Assert-Rejected { Get-VictoryAtomic64Coverage "VICTORY_ATOMIC64_RESULT=unsupported adapters=0 cases=0`nVICTORY_ATOMIC64_RESULT=executed adapters=1 cases=704" } 'Conflicting execution markers must fail.'
+    $coverage = Get-VictoryAtomicValidationCoverage 'VICTORY_ATOMIC_VALIDATION_RESULT=validated containers=88'
+    Assert-That ($coverage.status -eq 'validated' -and $coverage.containers -eq 88) 'The atomic matrix must report independent validation.'
+    Assert-Rejected { Get-VictoryAtomicValidationCoverage 'test result: ok. 1 passed;' } 'Compiler success cannot substitute for independent validation.'
+    Assert-Rejected { Get-VictoryAtomicValidationCoverage 'VICTORY_ATOMIC_VALIDATION_RESULT=validated containers=87' } 'An incomplete validation matrix must fail.'
+    Write-Host 'Diagnostics harness checks passed: external paths, argument quoting, environment isolation, dual-stream capture, nonzero exit, timeout, no overwrite and explicit semantic coverage.'
 } finally {
     [Environment]::SetEnvironmentVariable('VICTORY_DIAG_TEST_INHERITED', $oldInherited)
     if (Test-Path -LiteralPath (Join-Path $temp 'linked-copy')) { Remove-Item -LiteralPath (Join-Path $temp 'linked-copy') -Force }

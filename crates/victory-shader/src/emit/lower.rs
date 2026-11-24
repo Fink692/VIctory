@@ -5378,8 +5378,12 @@ impl<'a> Lower<'a> {
                 // These flags also let the host reject unsupported adapters.
                 self.s.flags |= flags::INT64 | flags::ATOMIC64_TYPED | flags::ATOMIC64_HEAP;
             }
-            let props1 = if wide { 0x107 } else { 0x105 }; // one U64 or U32
-            let h = self.handle(site, src, false, (kind | 0x1000, props1))?;
+            // Typed resources represent 64-bit elements with U32 components
+            // (R32G32_UINT); the i64 intrinsic selects the atomic width.
+            // DXC's CGHLSLMS.cpp likewise maps both I64 and U64 resource
+            // component types to U32. A U64 annotation is not the native
+            // resource representation, even if the DXIL validator accepts it.
+            let h = self.handle(site, src, false, (kind | 0x1000, 0x105))?;
             let at = self.begin_guarded(guard);
             let mut args = vec![h];
             let r = if let Some(comparison) = comparison {
@@ -6652,18 +6656,63 @@ mod tests {
             })
             .unwrap();
         // Descriptor loads reconstruct dimensions with a float4 handle.
-        // Integer accesses must retain their own type and width even
+        // Integer accesses must retain their own type and component count even
         // when they use that same descriptor in that same basic block.
         let float4 = l.handle(d.site, &d.source, false, (0x1002, 0x409)).unwrap();
         let uint32 = l.handle(d.site, &d.source, false, (0x1002, 0x105)).unwrap();
-        let uint64 = l.handle(d.site, &d.source, false, (0x1002, 0x107)).unwrap();
+        let uint2 = l.handle(d.site, &d.source, false, (0x1002, 0x205)).unwrap();
         assert_ne!(float4, uint32);
-        assert_ne!(float4, uint64);
-        assert_ne!(uint32, uint64);
+        assert_ne!(float4, uint2);
+        assert_ne!(uint32, uint2);
         assert_eq!(
-            uint64,
-            l.handle(d.site, &d.source, false, (0x1002, 0x107)).unwrap()
+            uint2,
+            l.handle(d.site, &d.source, false, (0x1002, 0x205)).unwrap()
         );
+    }
+
+    #[test]
+    fn image_atomics_use_u32_resource_components_at_both_operand_widths() {
+        // Reference: DXC cs_6_6 annotates RWTexture2D<uint64_t> and
+        // RWTexture2D<int64_t> atomic handles with {4098, 261}, including
+        // compare/exchange and signed min/max. Operand width comes from
+        // atomicBinOp.i64, not a U64 resource component annotation.
+        for op in [0x10, 0x11, 0x14, 0x15, 0x16, 0x17] {
+            for wide in [false, true] {
+                let native = super::super::atomic_tests::program(op, wide, true, false, None);
+                let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+                let res = resource::track(&p, &native.layout, native.stage).unwrap();
+                let io = io::raise(&p, &native).unwrap();
+                let st = structure::structure(&p).unwrap();
+                let parts = Parts {
+                    native: &native,
+                    p: &p,
+                    st: &st,
+                    io: &io,
+                    res: &res,
+                    inputs: vec![],
+                    outputs: vec![],
+                    prims: vec![],
+                    mesh_stride: 0,
+                };
+                let bad = HashMap::new();
+                let mut l = Lower::new(&parts, &bad);
+                // Lower the complete straight-line synthetic program, then
+                // inspect its actual annotated handles before serialization.
+                assert_eq!(p.blocks.len(), 1);
+                l.block[0] = Some(l.s.entry);
+                l.cur = l.s.entry;
+                assert!(l.inputs().is_ok());
+                for i in 0..p.blocks[0].insts.len() {
+                    assert!(l.inst(0, i).is_ok(), "op={op:#x}, wide={wide}, inst={i}");
+                }
+                let props: Vec<_> = l.handles.keys().map(|key| key.4).collect();
+                assert!(props.contains(&(0x1002, 0x105)), "{props:?}");
+                assert!(
+                    !props.contains(&(0x1002, 0x107)),
+                    "64-bit typed UAVs must use U32 resource components: {props:?}"
+                );
+            }
+        }
     }
 
     /// Lowers a compute program of constants: whether it translates.

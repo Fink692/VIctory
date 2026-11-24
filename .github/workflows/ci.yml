@@ -28,8 +28,8 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-      - name: Select the repository's pinned Rust toolchain
-        run: rustup show
+      - name: Install the repository's pinned Rust toolchain
+        run: rustup toolchain install --no-self-update
       - name: Check formatting of complete changed Rust files
         shell: pwsh
         env:
@@ -55,8 +55,8 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-      - name: Select the repository's pinned Rust toolchain
-        run: rustup show
+      - name: Install the repository's pinned Rust toolchain
+        run: rustup toolchain install --no-self-update
       - name: Test diagnostic process and path handling
         run: ./scripts/Test-DiagnosticsHarness.ps1
       - name: Validate synthetic tests and Windows builds

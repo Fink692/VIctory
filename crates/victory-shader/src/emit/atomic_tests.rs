@@ -18,6 +18,18 @@ const OPS: &[u8] = &[
     0x0f, 0x10, 0x11, 0x12, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a,
 ];
 
+/// Flush each native-call boundary so an access violation still leaves the
+/// exact shader and dispatch case in the diagnostic log.
+#[cfg(windows)]
+fn trace(args: std::fmt::Arguments<'_>) {
+    if std::env::var("VICTORY_ATOMIC_TRACE").is_ok_and(|v| v == "1") {
+        use std::io::Write;
+        let mut stderr = std::io::stderr().lock();
+        writeln!(stderr, "VICTORY_ATOMIC_TRACE {args}").unwrap();
+        stderr.flush().unwrap();
+    }
+}
+
 const fn s_mov(dst: u8, src: u8) -> u32 {
     0xBE80_0300 | (dst as u32) << 16 | src as u32
 }
@@ -183,9 +195,22 @@ fn build(
 fn image_atomics_translate_in_both_widths_and_return_modes() {
     let dxv = std::env::var_os("VICTORY_DXV");
     #[cfg(windows)]
-    let mut validator =
-        super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
-            .ok();
+    let mut validator = {
+        let loaded = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        );
+        match loaded {
+            Ok(validator) => Some(validator),
+            Err(e) if std::env::var_os("VICTORY_DXIL").is_some() => {
+                panic!("the explicitly requested DXIL validator could not load: {e}");
+            }
+            Err(e) => {
+                eprintln!("DXIL validator unavailable; native validation skipped: {e}");
+                None
+            }
+        }
+    };
+    let mut containers = 0;
     for &op in OPS {
         for wide in [false, true] {
             for glc in [false, true] {
@@ -207,15 +232,27 @@ fn image_atomics_translate_in_both_widths_and_return_modes() {
                     }
                     #[cfg(windows)]
                     if let Some(validator) = &mut validator {
+                        trace(format_args!(
+                            "phase=validate_begin op={op:#x} wide={wide} glc={glc} guarded={guarded}"
+                        ));
                         validator
                             .validate(&mut shader.dxil.clone())
                             .unwrap_or_else(|e| {
                                 panic!("op={op:#x}, wide={wide}, glc={glc}, guarded={guarded}: {e}")
                             });
+                        trace(format_args!(
+                            "phase=validate_end op={op:#x} wide={wide} glc={glc} guarded={guarded}"
+                        ));
                     }
+                    containers += 1;
                 }
             }
         }
+    }
+    assert_eq!(containers, 88);
+    #[cfg(windows)]
+    if validator.is_some() {
+        eprintln!("VICTORY_ATOMIC_VALIDATION_RESULT=validated containers={containers}");
     }
 }
 
@@ -275,16 +312,22 @@ fn image_atomic64_results_match_integer_semantics() {
     use windows::Win32::Graphics::Direct3D12::*;
 
     let mut ran = 0;
+    let mut cases_run = 0;
     let adapters: &[(&str, bool)] = if std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1") {
         &[("warp", true)]
     } else {
         &[("default adapter", false), ("warp", true)]
     };
     for &(label, warp) in adapters {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
-            continue;
+        trace(format_args!("phase=device_begin adapter={label:?}"));
+        let host = match Host::new(warp) {
+            Ok(host) => host,
+            Err(e) => {
+                eprintln!("no SM 6.6 {label} device; skipped: {e}");
+                continue;
+            }
         };
+        trace(format_args!("phase=device_end adapter={label:?}"));
         let mut opt1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
         let mut opt9 = D3D12_FEATURE_DATA_D3D12_OPTIONS9::default();
         let mut opt11 = D3D12_FEATURE_DATA_D3D12_OPTIONS11::default();
@@ -315,6 +358,12 @@ fn image_atomic64_results_match_integer_semantics() {
                     )
                     .is_ok()
         };
+        trace(format_args!(
+            "phase=capabilities adapter={label:?} queried={supported} int64={} typed={} heap={}",
+            opt1.Int64ShaderOps.as_bool(),
+            opt9.AtomicInt64OnTypedResourceSupported.as_bool(),
+            opt11.AtomicInt64OnDescriptorHeapResourceSupported.as_bool()
+        ));
         if !supported
             || !opt1.Int64ShaderOps.as_bool()
             || !opt9.AtomicInt64OnTypedResourceSupported.as_bool()
@@ -334,9 +383,15 @@ fn image_atomic64_results_match_integer_semantics() {
             for glc in [false, true] {
                 for guarded in [false, true] {
                     let shader = build(op, true, glc, guarded, None).unwrap();
+                    trace(format_args!(
+                        "phase=pipeline_begin adapter={label:?} op={op:#x} glc={glc} guarded={guarded}"
+                    ));
                     let (root, pso) = host
                         .compute_pipeline(&shader)
                         .unwrap_or_else(|e| panic!("{label}: {e}"));
+                    trace(format_args!(
+                        "phase=pipeline_end adapter={label:?} op={op:#x} glc={glc} guarded={guarded}"
+                    ));
                     for &(initial, value) in cases {
                         for matches in [false, true] {
                             for active in [false, true] {
@@ -364,6 +419,10 @@ fn image_atomic64_results_match_integer_semantics() {
                                         other => panic!("unexpected user data {other:?}"),
                                     };
                                 }
+                                trace(format_args!(
+                                    "phase=dispatch_begin adapter={label:?} case={} op={op:#x} initial={initial:#x} value={value:#x} matches={matches} glc={glc} guarded={guarded} active={active}",
+                                    cases_run + 1
+                                ));
                                 let out = host
                                     .dispatch(
                                         &root,
@@ -376,6 +435,10 @@ fn image_atomic64_results_match_integer_semantics() {
                                         },
                                     )
                                     .unwrap_or_else(|e| panic!("{label}: {e}"));
+                                trace(format_args!(
+                                    "phase=dispatch_end adapter={label:?} case={}",
+                                    cases_run + 1
+                                ));
                                 let actual_returned =
                                     u64::from(out[0][0]) | u64::from(out[0][1]) << 32;
                                 let actual_final =
@@ -414,6 +477,7 @@ fn image_atomic64_results_match_integer_semantics() {
                                     (returned, expected),
                                     "{label}, op={op:#x}, initial={initial:#x}, value={value:#x}, matches={matches}, glc={glc}, guarded={guarded}, active={active}"
                                 );
+                                cases_run += 1;
                             }
                         }
                     }
@@ -423,5 +487,9 @@ fn image_atomic64_results_match_integer_semantics() {
     }
     if ran == 0 {
         eprintln!("64-bit image atomics execution NOT validated: no capable adapter");
+        eprintln!("VICTORY_ATOMIC64_RESULT=unsupported adapters=0 cases=0");
+    } else {
+        assert_eq!(cases_run, ran * 704);
+        eprintln!("VICTORY_ATOMIC64_RESULT=executed adapters={ran} cases={cases_run}");
     }
 }

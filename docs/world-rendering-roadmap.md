@@ -10,20 +10,27 @@ evidence; it does not claim that the title is playable.
 
 | Area | Change | Evidence and remaining check |
 | --- | --- | --- |
-| Integer image atomics | Lower 11 operations at 32 and 64 bits, including compare/exchange, signed extrema, returned old values and inactive lanes. Declare the required DXIL/SFI0 features. | Synthetic cases cover width, return behavior and execution guards; all 88 emitted containers passed the official DXC validator. A semantic execution test is included for capable Windows adapters; execution has not been observed here. |
-| Resource handles and lane masks | Key cached handles by both resource-property words; declare wave operations when emitting lane-index queries. | Regression tests and independent validation cover the float/U64 handle collision and missing feature flag. |
+| Integer image atomics | Lower 11 operations at 32 and 64 bits, including compare/exchange, signed extrema, returned old values and inactive lanes. Declare the required DXIL/SFI0 features. | Synthetic cases cover width, return behavior and execution guards; all 88 emitted containers passed the official DXC validator. The Windows gate records semantic execution separately from an unsupported adapter. Inspect the tested commit's CI result; no physical-GPU/title execution is claimed. |
+| Resource handles and lane masks | Key cached handles by both resource-property words; declare wave operations when emitting lane-index queries. | Regression tests and independent validation cover the float/integer handle collision and missing feature flag. Atomic resource annotations also follow the canonical output of Microsoft's HLSL compiler. |
 | Capability checks and shader cache | Check actual host int64, typed-atomic and descriptor-heap-atomic capabilities, including shaders loaded from cache. Invalidate old generated shader cache entries. | Windows code cross-compiles. Confirm actual adapter features and behavior from a Windows run. |
-| GPU queries and ordering | Allocate host query heaps, record begin/end/resolve operations, preserve query lifetime through submission, track host buffer states and perform buffer copies on the GPU. Use the host queue's clock/frequency. | Synthetic Windows tests check timestamp destinations, measured empty occlusion/statistics queries and resolve-to-copy ordering. Windows execution remains required. |
-| Indirect execution | Saturate the work budget, honor actual count-buffer values, validate argument/count ranges and transition the count buffer for indirect reads. | CPU boundary tests and an opt-in WARP execution regression cover overflow and inactive records. Physical GPU/title execution remains required. |
+| GPU queries and ordering | Allocate host query heaps, record begin/end/resolve operations, preserve query lifetime through submission, track host buffer states and perform buffer copies on the GPU. Use the host queue's clock/frequency. | Required hosted Windows/WARP tests passed for timestamp destinations, measured empty occlusion/statistics queries and resolve-to-copy ordering. Physical GPU/title execution remains required. |
+| Indirect execution | Saturate the work budget, honor actual count-buffer values, validate argument/count ranges and transition the count buffer for indirect reads. | CPU boundary tests and the required hosted WARP regression passed for overflow, inactive records and binding conflicts. Physical GPU/title execution remains required. |
 | Shader census | Add deterministic JSON failure groups and per-program runtime-compatible hashes; distinguish emitted, validated and pipeline-created results. Surface scan and check-initialization errors. | CLI tests cover failure gates, unavailable checks, hashes, report serialization and refusing output replacement. Full title inputs are not available in this workspace. |
-| Reproducible diagnostics | Add isolated saves/caches, deadlines, separate process logs, loop-limit/pipeline/console experiments and explicit observation records. | Synthetic process tests exercise quoting, environment isolation, output capture, failures, deadlines and output paths. They do not execute the title. |
-| Automated verification | Add Windows synthetic DXIL/WARP gates and portable tests, build/lint checks and asset-policy checks. | Local native tests and Windows cross-compilation are available; the remote Windows job must execute for runtime evidence. |
+| Reproducible diagnostics | Add isolated saves/caches, deadlines, separate process logs, loop-limit/pipeline/console experiments and explicit observation records. | Synthetic process tests passed on Linux and hosted Windows for quoting, environment isolation, output capture, failures, deadlines and output paths. They do not execute the title. |
+| Automated verification | Add Windows synthetic DXIL/WARP gates and portable tests, build/lint checks and asset-policy checks. | Local native tests, Windows cross-compilation and hosted Linux checks passed. Check the complete Windows job and recorded coverage for the exact commit before accepting it. |
 
 The actual title's shader totals, frame times, screenshots and compatibility
 claims must be remeasured. A source or compiler test must not be reported as
 a hardware result. Some Windows-only tests use their own linked PE executable;
 those remain Windows tests, while synthetic parser/compiler tests run on
 Linux as well.
+
+The first hosted Windows run confirmed the required query/indirect checks
+but exposed an access violation in the larger shader suite. That finding
+led to correcting the atomic resource annotation and adding isolated
+validation/execution checks with explicit coverage markers. A passing
+subset is not a passing workflow; use the current result linked from the
+pull request, including any subsequent fixes.
 
 The buffer-state work covers known vertex/index, descriptor/root-buffer,
 indirect, query and buffer-copy paths. It does not establish arbitrary
@@ -57,9 +64,9 @@ actually used by the missing world passes.
 | Input and system UI | Verify controller input, text entry, trigger-rumble support and title relaunch on Windows. | Live interaction and restart/save continuity tests; unsupported device capabilities reported explicitly. |
 | Series S mode | Repeat the exact accepted scene and save workflow in Series S mode. | Separate correctness, stability and performance results; Series X success does not imply Series S success. |
 
-These items remain open. Several require user-supplied title files and a
-Windows D3D12 machine, neither of which is available to this Linux build
-environment. The diagnostics scripts make those runs concrete and bounded;
+These items remain open. User-supplied title files and a Windows PC with a
+physical GPU were not available to the development workspace. Hosted WARP
+checks exercise synthetic inputs. The diagnostics scripts make title runs concrete and bounded;
 they do not manufacture observations or substitute placeholders for missing
 runtime behavior.
 
