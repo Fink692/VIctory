@@ -18,7 +18,7 @@ evidence; it does not claim that the title is playable.
 | Texture copies and readback | Copy buffer footprints through GPU staging so earlier GPU writes are visible; implement texture-to-buffer readback, partial destinations and same-texture mip copies. Validate ranges and repack title row pitches/offsets into native layouts; expand validated BC edges to full physical blocks. | All five authored Windows copy tests passed, including GPU-produced input, guard bytes, partial pixels, reverse-recorded producer/consumer lists, compressed small mips and selected depth/stencil planes. The BC regression also passed on both compared WARP versions. Title verification remains required. |
 | GPU-produced constants and raw copies | Stage unaligned root CBVs and table CBVs from their GPU shadows at each use; reuse stable descriptors while refreshing their contents in command order. Route the console raw-address copy command through GPU buffer copies. | Authored native fixtures check root/table shader reads, repeated draws and submissions, reverse-recorded lists, overlap, padding and invalid ranges. The strict Windows gate requires these tests; title verification remains separate. |
 | Byte/halfword shared memory | Lower 14 LDS subword instructions, including signed reads and d16 half-register preservation; use atomic word updates/reads so neighboring byte writers do not race. | All 168 synthetic containers passed independent DXV validation. The mandatory Windows test executed all 496 dispatch cases per adapter, including cross-wave neighboring fields, on both compared WARP versions. Physical GPU/title verification remains required. |
-| Single-dword shared-memory bounds | Guard 32-bit LDS reads, writes and supported atomics before forming a memory pointer; out-of-range reads return zero, writes are dropped and inactive destinations remain unchanged. Invalidate older generated shader caches. | Independent DXIL validation and required native result tests cover valid edges, out-of-range addresses, inactive lanes and atomic returned values. Multi-dword boundary/alignment modes remain outside this change. |
+| Single-dword shared-memory bounds | Guard 32-bit LDS reads, writes and supported atomics before forming a memory pointer; out-of-range reads return zero, writes are dropped and inactive destinations remain unchanged. Lower subtraction as atomic addition of the wrapping negated operand and invalidate older generated shader caches. | Independent DXIL validation and required native result tests cover valid edges, out-of-range addresses, inactive lanes and atomic returned values. Multi-dword boundary/alignment modes remain outside this change. |
 | CPU fence waits and submission errors | Implement blocking null-event fence waits with completion retained across later fence rewinds. Stop on native signal/event/wait failure before copying GPU data back to the CPU. | Threaded tests cover registration races, independent targets and rewinds. Normal native tests exercise successful submissions; injected native synchronization failures have not been executed. |
 | Depth bounds | Preserve the enable bit in graphics/mesh pipeline streams, check host support, route dynamic title state and reset native bounds. | All 14 measured cases passed on WARP 1.0.22 with valid descriptor bindings and no unexpected debug-layer errors. Inbox WARP 10.0.26100.33648 advertised support but failed the depth-disabled combination. Unsupported capabilities remain explicit; physical GPU/title verification is separate. |
 | Indirect execution | Saturate the work budget, honor actual count-buffer values, validate argument/count ranges and transition the count buffer for indirect reads. | CPU boundary tests and the required hosted WARP regression passed for overflow, inactive records and binding conflicts. Physical GPU/title execution remains required. |
@@ -31,6 +31,16 @@ claims must be remeasured. A source or compiler test must not be reported as
 a hardware result. Some Windows-only tests use their own linked PE executable;
 those remain Windows tests, while synthetic parser/compiler tests run on
 Linux as well.
+
+The first native single-dword LDS matrix exposed an existing emitter error:
+its first subtraction dispatch suspended WARP in all three concurrent runs.
+The containers had passed validation, but Microsoft's
+[DXIL specification](https://github.com/microsoft/DirectXShaderCompiler/blob/main/docs/DXIL.rst)
+forbids `atomicrmw sub` for groupshared memory. Subtraction now uses one atomic
+add with a wrapping negated operand, matching an authored official-DXC
+reference and retaining all 552 semantic cases. See
+[the initial failing run](https://github.com/Fink692/VIctory/actions/runs/45469493365)
+and the current PR workflow for the native result after that correction.
 
 The first hosted Windows run confirmed the required query/indirect checks
 but exposed an access violation in the larger shader suite. That finding

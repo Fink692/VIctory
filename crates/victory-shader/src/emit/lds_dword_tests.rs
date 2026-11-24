@@ -331,7 +331,9 @@ fn lds_dword_bounds_and_inactive_lanes_preserve_memory() {
                     trace(format_args!(
                         "phase=pipeline_begin adapter={label:?} access={access:?} offset={offset} guarded={guarded}"
                     ));
-                    let (root, pipeline) = host.compute_pipeline(&shader).unwrap();
+                    let (root, pipeline) = host.compute_pipeline(&shader).unwrap_or_else(|e| {
+                        panic!("{label}: {access:?}, offset={offset}, guarded={guarded}: pipeline failed: {e}")
+                    });
                     for inputs in [
                         [0xffff_fffc, 3, 0x1234_0000, 0xacce_55ed, 0, 128],
                         [0x7fff_fffc, 0x8000_0001, u32::MAX, 0x6bad_beef, 0, 64],
@@ -363,7 +365,12 @@ fn lds_dword_bounds_and_inactive_lanes_preserve_memory() {
                                     groups: [1, 1, 1],
                                 },
                             )
-                            .unwrap();
+                            .unwrap_or_else(|e| {
+                                panic!(
+                                    "{label}: case={}, {access:?}, offset={offset}, guarded={guarded}, inputs={inputs:x?}: dispatch failed: {e}",
+                                    count + 1
+                                )
+                            });
                         assert_eq!(
                             actual[0],
                             expected(access, offset, guarded, inputs),

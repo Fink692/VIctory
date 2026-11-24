@@ -2188,7 +2188,7 @@ impl<'a> Lower<'a> {
         use super::bitcode::Rmw;
         let rmw = match op.as_str() {
             "add_u32" => Some(Rmw::Add),
-            "sub_u32" => Some(Rmw::Sub),
+            "sub_u32" => Some(Rmw::Add),
             "and_b32" => Some(Rmw::And),
             "or_b32" => Some(Rmw::Or),
             "xor_b32" => Some(Rmw::Xor),
@@ -2200,7 +2200,15 @@ impl<'a> Lower<'a> {
             "cmpst_b32" => None,
             _ => return Err("an LDS operation"),
         };
-        let v0 = self.vgprs(inst, data.first().ok_or("an LDS atomic")?, 1)?[0];
+        let mut v0 = self.vgprs(inst, data.first().ok_or("an LDS atomic")?, 1)?[0];
+        if op == "sub_u32" {
+            // DXIL forbids atomicrmw sub even though the validator accepts
+            // it. One atomic add of the wrapping negation implements the
+            // same u32 subtraction and still returns the original value.
+            // Match DXC's InterlockedAdd(destination, 0u - value, old).
+            let zero = self.s.m.i32(0);
+            v0 = self.s.m.bin(self.cur, Bin::Sub, zero, v0);
+        }
         let v1 = match data.get(1) {
             Some(d) => Some(self.vgprs(inst, d, 1)?[0]),
             None => None,

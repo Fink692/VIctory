@@ -68,12 +68,12 @@ pub(crate) enum Bin {
     Xor = 12,
 }
 
-/// `atomicrmw` operations.
+/// DXIL-supported `atomicrmw` operations. LLVM's Sub (2) and Nand (4)
+/// are deliberately absent: DXIL's groupshared atomics forbid them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Rmw {
     Xchg = 0,
     Add = 1,
-    Sub = 2,
     And = 3,
     Or = 5,
     Xor = 6,
