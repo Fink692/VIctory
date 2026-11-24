@@ -142,6 +142,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
+        list.bind_buffer(&shadow.buffer, false);
         return Some(gpu);
     }
     let (gpu, to) = list.scratch(len)?;
@@ -333,6 +334,13 @@ impl State {
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+        list.begin_buffer_bindings();
+        let ready = self.prepare_bindings(list, indexed, mesh);
+        let compatible = list.finish_buffer_bindings();
+        ready && compatible
+    }
+
+    fn prepare_bindings(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
@@ -341,7 +349,10 @@ impl State {
             return false;
         };
         if p.compute || p.mesh != mesh {
-            once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
+            once!(
+                mesh,
+                "a draw or mesh dispatch with another kind of pipeline"
+            );
             return false;
         }
         self.bind(list, p, false);
@@ -361,6 +372,7 @@ impl State {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            list.bind_buffer(&shadow.buffer, false);
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -379,6 +391,7 @@ impl State {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            list.bind_buffer(&shadow.buffer, false);
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -513,7 +526,12 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        list.begin_buffer_bindings();
         self.bind(list, p, true);
+        if !list.finish_buffer_bindings() {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
@@ -951,7 +969,17 @@ impl State {
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
-        let len = u64::from(stride) * u64::from(max.max(1));
+        if max == 0 {
+            return true;
+        }
+        let Some(len) = crate::indirect::argument_bytes(kind, stride, max) else {
+            why("invalid argument stride or count");
+            return false;
+        };
+        if !arguments.is_multiple_of(4) || count.is_some_and(|at| !at.is_multiple_of(4)) {
+            why("arguments or counter are not 4-byte aligned");
+            return false;
+        }
         let Some(args) = crate::shadow::find(arguments, len) else {
             why("arguments outside title buffers");
             return false;
@@ -978,7 +1006,13 @@ impl State {
             s.refresh(list, *at, 4);
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
+        if !crate::indirect::bound(
+            list,
+            &args.buffer,
+            args.gpu(arguments),
+            (kind, stride, max),
+            counter.as_ref().map(|(s, at)| (&s.buffer, s.gpu(*at))),
+        ) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         }
@@ -989,25 +1023,41 @@ impl State {
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
                 Some(p) if p.compute => {
+                    list.begin_buffer_bindings();
                     self.bind(list, p, true);
-                    true
+                    list.finish_buffer_bindings()
                 }
                 _ => false,
             },
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
+            crate::indirect::done(list, &args.buffer, counter.as_ref().map(|(s, _)| &s.buffer));
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
-                Some(p) => why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
+                Some(p) => why(&format!(
+                    "prepare failed (compute {}, mesh {})",
+                    p.compute, p.mesh
+                )),
             }
+            return false;
+        }
+        if list.buffer_is_uav(&args.buffer)
+            || counter
+                .as_ref()
+                .is_some_and(|(s, _)| list.buffer_is_uav(&s.buffer))
+        {
+            crate::indirect::done(list, &args.buffer, counter.as_ref().map(|(s, _)| &s.buffer));
+            once!("indirect execution dropped: argument/count buffer also bound as a shader UAV");
             return false;
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
-            self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
+            self.op_text(
+                format!("indirect kind {kind} max {max} at {arguments:#x}"),
+                kind == DISPATCH,
+            )
         });
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
@@ -1021,7 +1071,7 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
-        crate::indirect::done(list, &args.buffer);
+        crate::indirect::done(list, &args.buffer, counter.as_ref().map(|(s, _)| &s.buffer));
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -1083,6 +1133,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
         && let Some(shadow) = crate::shadow::find(address, len)
     {
         shadow.refresh(list, address, len);
+        list.bind_buffer(&shadow.buffer, u.kind == ResourceType::Uav);
         if u.kind == ResourceType::Uav {
             shadow.gpu_writes(list, address, len);
         }
@@ -1124,7 +1175,10 @@ fn describe(view: Option<&View>) -> String {
         crate::resource::host_resource(r).map(|t| {
             // SAFETY: a live resource.
             let d = unsafe { t.GetDesc() };
-            format!("{}x{} f{} flags {:#x}", d.Width, d.Height, d.Format.0, d.Flags.0)
+            format!(
+                "{}x{} f{} flags {:#x}",
+                d.Width, d.Height, d.Format.0, d.Flags.0
+            )
         })
     };
     match view {

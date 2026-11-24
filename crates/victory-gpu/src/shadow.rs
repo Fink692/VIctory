@@ -9,11 +9,18 @@
 //! neither works. A title GPU address inside the buffer is the same offset
 //! in its copy. Ranges shaders write go back to title memory after the
 //! submission ([`Shadow::gpu_writes`]).
+//! Known root/table, vertex/index, indirect, query and copy uses have their
+//! native buffer states tracked by [`HostList`], including across lists.
 //!
 //! shortcut: only the ranges draws are known to read are brought up to
 //! date (vertex and index buffer views, constant buffers in tables, root
 //! descriptors, buffer views in tables); buffers read through directly
-//! indexed heaps keep what their first use copied.
+//! indexed heaps keep what their first use copied, and arbitrary heap
+//! indices do not declare their state needs. Distinct overlapping shadow
+//! allocations are not coherent aliases. CPU snapshot paths (unaligned
+//! CBVs, expanded geometry, buffer-to-texture uploads) still cannot read
+//! same-submission GPU outputs; GPU buffer copies and known direct shader
+//! bindings can.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -155,7 +162,8 @@ impl Shadow {
             .push((address, address + len));
         let (from, to) = self.inside(address, len);
         // SAFETY: inside the mapping.
-        let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
+        let host =
+            |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let (start, end) = match &*before {
             Some((at, bytes)) => ((*at).min(from), (at + bytes.len()).max(to)),

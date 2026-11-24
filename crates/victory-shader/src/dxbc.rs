@@ -111,6 +111,22 @@ impl<'a> Container<'a> {
     }
 }
 
+/// Bytes that identify one shader container, excluding an enclosing
+/// archive's trailing data or runtime allocation padding.
+///
+/// Only a successfully parsed DXBC is trimmed to its header's total size.
+/// Invalid input is returned intact, so malformed containers remain
+/// distinguishable. All bytes inside the container are retained: signatures,
+/// unknown parts, and Xbox native blobs after the DXIL bitcode or program.
+pub fn canonical_bytes(data: &[u8]) -> &[u8] {
+    if Container::parse(data).is_ok() {
+        let total = u32_at(data, 0x18).expect("parsed container size") as usize;
+        &data[..total]
+    } else {
+        data
+    }
+}
+
 pub(crate) fn u16_at(data: &[u8], at: usize) -> Result<u16, ShaderError> {
     data.get(at..at + 2)
         .map(|b| u16::from_le_bytes(b.try_into().expect("2 bytes")))
@@ -177,5 +193,45 @@ mod tests {
         assert!(Container::parse(&bytes).is_err());
         bytes.truncate(last);
         assert!(Container::parse(&bytes).is_err());
+    }
+
+    #[test]
+    fn canonical_bytes_ignore_padding_but_keep_signatures_and_part_trailers() {
+        let mut program = crate::dxil::build_standard(5, (6, 6), 0x106, b"BC\xc0\xde");
+        // Extra data inside a DXIL part is significant even beyond its
+        // declared program size; the native decoder consumes the whole part.
+        program.extend_from_slice(b"synthetic native extension");
+        let original = build(&[(FourCC::DXIL, &program), (FourCC::OSG1, &[1, 2, 3, 4])]);
+        let mut padded = original.clone();
+        padded.extend_from_slice(b"unrelated archive or allocation data");
+        assert_eq!(canonical_bytes(&padded), original);
+        let container = Container::parse(canonical_bytes(&padded)).unwrap();
+        assert_eq!(container.part(FourCC::DXIL).unwrap().data, program);
+
+        let signature_changed = build(&[(FourCC::DXIL, &program), (FourCC::OSG1, &[1, 2, 3, 5])]);
+        assert_ne!(
+            canonical_bytes(&signature_changed),
+            canonical_bytes(&padded)
+        );
+        *program.last_mut().unwrap() ^= 1;
+        let native_changed = build(&[(FourCC::DXIL, &program), (FourCC::OSG1, &[1, 2, 3, 4])]);
+        assert_ne!(canonical_bytes(&native_changed), canonical_bytes(&padded));
+    }
+
+    #[test]
+    fn canonical_bytes_preserve_invalid_and_truncated_containers() {
+        assert_eq!(canonical_bytes(b"not a container"), b"not a container");
+        let original = build(&[(FourCC::DXIL, b"synthetic metadata")]);
+        let truncated = &original[..original.len() - 1];
+        assert_eq!(canonical_bytes(truncated), truncated);
+        // A referenced part outside the header's claimed size is invalid;
+        // keep that data rather than blindly trusting the total-size word.
+        let mut short_header = original.clone();
+        short_header[0x18..0x1c].copy_from_slice(&36u32.to_le_bytes());
+        assert!(Container::parse(&short_header).is_err());
+        assert_eq!(canonical_bytes(&short_header), short_header);
+        let mut bad_part = original;
+        bad_part[0x20..0x24].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(canonical_bytes(&bad_part), bad_part);
     }
 }
