@@ -1,0 +1,77 @@
+name: Build and rendering validation
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      format_base_ref:
+        description: Base commit/ref for changed-file formatting
+        required: true
+        default: HEAD^
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: victory-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Select the repository's pinned Rust toolchain
+        run: rustup show
+      - name: Check formatting of complete changed Rust files
+        shell: pwsh
+        env:
+          FORMAT_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before || inputs.format_base_ref }}
+        run: ./scripts/Test-ChangedRustFormat.ps1 -BaseRef "$env:FORMAT_BASE_REF"
+      - name: Test diagnostic process and path handling
+        shell: pwsh
+        run: ./scripts/Test-DiagnosticsHarness.ps1
+      - name: Run platform-independent synthetic tests
+        run: cargo test --locked --workspace --all-features
+      - name: Check portable CLI and feature compilation
+        run: cargo check --locked --workspace --all-targets --all-features
+      - name: Enforce the asset policy
+        run: cargo run --locked --quiet -p xtask -- policy
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Select the repository's pinned Rust toolchain
+        run: rustup show
+      - name: Test diagnostic process and path handling
+        run: ./scripts/Test-DiagnosticsHarness.ps1
+      - name: Validate synthetic tests and Windows builds
+        env:
+          FORMAT_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before || inputs.format_base_ref }}
+        run: ./scripts/Test-Victory.ps1 -RequireGpu -FormatBaseRef "$env:FORMAT_BASE_REF" -OutputRoot "$env:RUNNER_TEMP/victory-checks"
+      - name: Keep asset-free validation logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-validation
+          path: |
+            ${{ runner.temp }}/victory-checks/**/checks.json
+            ${{ runner.temp }}/victory-checks/**/*.process.json
+            ${{ runner.temp }}/victory-checks/**/*.stdout.log
+            ${{ runner.temp }}/victory-checks/**/*.stderr.log
+          if-no-files-found: ignore
+          retention-days: 7

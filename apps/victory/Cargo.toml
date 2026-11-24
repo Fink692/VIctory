@@ -19,6 +19,9 @@ blake3.workspace = true
 memchr.workspace = true
 clap.workspace = true
 walkdir.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
 
 [features]
 # Debug-level logs and the debugging switches (frame capture, stack dumps,

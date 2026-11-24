@@ -39,10 +39,18 @@ What each part does today and what it still needs:
 | Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
 | Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
 | GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
-| GPU: world | Mesh pipelines, shader-written buffers, descriptor lifetimes, indirect execution (arguments clamped), pipelines made by worker threads and kept on disk | Most of the scene is still missing (untranslated shaders drop draws); frames take seconds; real queries, depth bounds, HDR and scaling are missing |
-| Shaders | Console GPU code recompiled to DXIL at first use, cached on disk. Menus: all. World: mesh 8,191 of 8,506, vertex/pixel 10,617 of 12,346, compute 1,643 of 2,539 | 64-bit image atomics, merged geometry stages, the ray-tracing builder's shaders; some compute programs need a GPU with 64-lane waves |
+| GPU: world | Mesh pipelines, shader-written buffers, descriptor lifetimes, bounded indirect execution, worker-created pipelines cached on disk; native query recording and readback implemented | Most of the scene is still missing; hardware verification of the new query/indirect paths, depth bounds, HDR and scaling remain |
+| Shaders | Console GPU code recompiled to DXIL at first use, cached on disk; 32/64-bit integer image atomics covered by synthetic translation and DXIL validation | Atomics execution on a capable Windows adapter, merged geometry stages, the ray-tracing builder's shaders; some compute programs need a GPU with 64-lane waves |
 | Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
 | Series S mode | Runs through the menus to the loading screen | The world, as above |
+
+The title results above describe the last reported hardware run, before the
+new atomic, query and indirect-execution changes. That run's offline shader
+census was mesh 8,191/8,506, vertex/pixel 10,617/12,346 and compute 1,643/2,539.
+Those counts have not been remeasured with this branch and do not establish
+which shaders execute in the world. See the
+[implementation status and remaining gates](docs/world-rendering-roadmap.md)
+and the [reproducible diagnostics workflow](docs/diagnostics.md).
 
 ## Getting started
 
@@ -93,6 +101,7 @@ victory census [paths...] [--missing] [--strict]
 victory lib-exports <import.lib> [--list]
 victory shader-info [paths...] [--verbose] [--disasm]
 victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
+                  [--report <external-path.json>] [--fail-on-error]
 victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-x|series-s] [-- <title arguments>]
 victory config
@@ -101,6 +110,14 @@ victory config
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
 
+`translate --report` writes a new JSON file outside the repository, with
+per-program hashes, stage counts and grouped failure causes. Validation and
+pipeline checks that were not run remain `null`, not successful. With
+`--fail-on-error`, an incomplete scan, unsupported program, failed check or
+scan with no native programs exits unsuccessfully after writing its report.
+Translation alone can run on Linux; DXIL DLL validation, host pipeline
+creation and the title runtime require Windows.
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with
@@ -108,6 +125,16 @@ A release build has no debugging aids. Build them in with
 ```powershell
 cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
 ```
+
+For a repeatable check without game files, use PowerShell 7.2 or newer:
+
+```powershell
+pwsh -NoProfile -File scripts/Test-Victory.ps1 -RequireGpu
+```
+
+The [diagnostics guide](docs/diagnostics.md) covers bounded WARP runs,
+shader reports, independent save/cache directories, Series X/S comparisons
+and the evidence required before claiming a visible world or a speedup.
 
 | Variable | Effect |
 |----------|--------|

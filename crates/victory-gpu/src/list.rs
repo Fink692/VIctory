@@ -416,7 +416,8 @@ fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
     Some(unsafe { data.add(offset as usize) })
 }
 
-/// Buffer to buffer: both are host memory, copied at submission.
+/// Buffer copies execute in the GPU stream, after preceding dispatches
+/// and query resolves. CPU-deferred copies would read stale title bytes.
 extern "system" fn copy_buffer_region(
     this: This,
     dst: This,
@@ -430,10 +431,62 @@ extern "system" fn copy_buffer_region(
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
-        list.defer_copy(to, from, len as usize);
+        copy_buffers(list, to as u64, from as u64, len);
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_offset, src, src_offset, len);
+}
+
+/// Copies shadow memory at its recorded position. A shared source and
+/// destination need a staging allocation: legacy resource states cannot
+/// make one buffer COPY_SOURCE and COPY_DEST simultaneously.
+#[cfg(windows)]
+pub(crate) fn copy_buffers(list: &crate::host::HostList, to: u64, from: u64, len: u64) -> bool {
+    use windows::Win32::Graphics::Direct3D12::*;
+    if len == 0 || to == from {
+        return true;
+    }
+    let (Some(src), Some(dst)) = (crate::shadow::find(from, len), crate::shadow::find(to, len))
+    else {
+        return false;
+    };
+    let staging = if src.buffer == dst.buffer {
+        let Some((buffer, _)) = crate::host::host().and_then(|host| host.shared_buffer(len)) else {
+            return false;
+        };
+        Some(buffer)
+    } else {
+        None
+    };
+    src.refresh(list, from, len);
+    dst.refresh(list, to, len);
+    dst.gpu_writes(list, to, len);
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| format!("copy buffer {from:#x} to {to:#x}, {len:#x} bytes"));
+    list.buffer_state(&src.buffer, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    // SAFETY: live shadow buffers retained by their refreshes and states;
+    // find checked both ranges. The state table retains staging as well.
+    unsafe {
+        if let Some(staging) = staging {
+            list.buffer_state(&staging, D3D12_RESOURCE_STATE_COPY_DEST);
+            list.list
+                .CopyBufferRegion(&staging, 0, &src.buffer, src.offset(from), len);
+            list.buffer_state(&staging, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list.buffer_state(&dst.buffer, D3D12_RESOURCE_STATE_COPY_DEST);
+            list.list
+                .CopyBufferRegion(&dst.buffer, dst.offset(to), &staging, 0, len);
+        } else {
+            list.buffer_state(&dst.buffer, D3D12_RESOURCE_STATE_COPY_DEST);
+            list.list.CopyBufferRegion(
+                &dst.buffer,
+                dst.offset(to),
+                &src.buffer,
+                src.offset(from),
+                len,
+            );
+        }
+    }
+    true
 }
 
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
@@ -457,7 +510,15 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
-            list.defer_copy(to, from, a.min(b) as usize);
+            if a != b {
+                tracing::warn!(
+                    dst_size = a,
+                    src_size = b,
+                    "buffer CopyResource sizes differ"
+                );
+                return;
+            }
+            copy_buffers(list, to as u64, from as u64, a);
         }
     }
     #[cfg(not(windows))]
@@ -746,8 +807,13 @@ extern "system" fn clear_dsv(
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
-            list.list
-                .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
+            list.list.ClearDepthStencilView(
+                dsv,
+                D3D12_CLEAR_FLAGS(flags as i32 & 3),
+                depth,
+                stencil,
+                rects,
+            )
         };
     }
     #[cfg(not(windows))]
@@ -793,52 +859,42 @@ extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
     }
 }
 
-/// `BeginQuery`/`EndQuery(heap, type, index)`: queries are answered when
-/// resolved.
-extern "system" fn query_mark(_: This, _heap: This, _kind: u32, _index: u32) {}
+/// Queries execute at their recorded position on the host GPU.
+extern "system" fn begin_query(this: This, heap: This, kind: u32, index: u32) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        crate::query::mark(list, heap, kind, index, true);
+    }
+    #[cfg(not(windows))]
+    let _ = (this, heap, kind, index);
+}
 
-/// `ResolveQueryData(heap, type, first, count, buffer, offset)`: writes
-/// each query's result into the buffer once the list has run. Timestamps
-/// (type 2) are the GPU clock then; occlusion counts (0) say a million
-/// samples passed and binary occlusion (1) visible, so nothing is culled
-/// by a query.
-/// shortcut: no query runs on the host GPU; results are plausible values,
-/// not measured ones (time spans come out as the submission's length).
+extern "system" fn end_query(this: This, heap: This, kind: u32, index: u32) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        crate::query::mark(list, heap, kind, index, false);
+    }
+    #[cfg(not(windows))]
+    let _ = (this, heap, kind, index);
+}
+
 extern "system" fn resolve_queries(
     this: This,
-    _heap: This,
+    heap: This,
     kind: u32,
-    _first: u32,
+    first: u32,
     count: u32,
     buffer: This,
     offset: u64,
 ) {
-    const OCCLUSION: u32 = 0;
-    const BINARY: u32 = 1;
-    const TIMESTAMP: u32 = 2;
-    const PIPELINE_STATISTICS: u32 = 3;
-    let Some((data, size)) = crate::resource::buffer_bytes(buffer) else {
-        return;
-    };
-    let (what, bytes) = match kind {
-        OCCLUSION => (Written::Value(1 << 20), 8),
-        BINARY => (Written::Value(1), 8),
-        TIMESTAMP => (Written::GpuTimestamp, 8),
-        PIPELINE_STATISTICS => (Written::Value(0), 88),
-        _ => (Written::Value(0), 16),
-    };
-    if offset + u64::from(count) * bytes > size {
-        return;
+    #[cfg(windows)]
+    if let Some(list) = host_list(this)
+        && let Some((data, size)) = crate::resource::buffer_bytes(buffer)
+    {
+        crate::query::resolve(list, heap, kind, first, count, data, size, offset);
     }
-    for i in 0..u64::from(count) {
-        // Wider results are written as 8-byte pieces.
-        for piece in 0..bytes / 8 {
-            // SAFETY: inside the buffer, checked above.
-            let at = unsafe { data.add((offset + i * bytes + piece * 8) as usize) };
-            let what = if piece == 0 { what } else { Written::Value(0) };
-            defer_write(this, at as u64, what, 8);
-        }
-    }
+    #[cfg(not(windows))]
+    let _ = (this, heap, kind, first, count, buffer, offset);
 }
 
 /// IUnknown 3, object 4, device child 1, allocator 2.
@@ -879,7 +935,10 @@ extern "system" fn reset_x(this: This, allocator: This, pipeline: This, _flags: 
 /// `E_NOTIMPL` as a pointer).
 extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mut u8 {
     let align = usize::try_from(alignment).unwrap_or(0).max(16);
-    let Some(len) = usize::try_from(size).ok().and_then(|s| s.checked_add(align)) else {
+    let Some(len) = usize::try_from(size)
+        .ok()
+        .and_then(|s| s.checked_add(align))
+    else {
         return std::ptr::null_mut();
     };
     if this.is_null() || !align.is_power_of_two() {
@@ -892,7 +951,10 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
     // Moving the vector keeps its heap block where it is.
-    uploads.lock().unwrap_or_else(|e| e.into_inner()).push(block);
+    uploads
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(block);
     at
 }
 
@@ -1128,6 +1190,18 @@ extern "system" fn draw(_: This) {
     count_draw();
 }
 
+/// A checked GPU address for a byte range inside a title buffer. Checking
+/// only the resulting address against shadow memory could select adjacent
+/// allocations instead of the resource passed to ExecuteIndirect.
+fn indirect_address(data: u64, size: u64, offset: u64, len: u64) -> Option<u64> {
+    let end = offset.checked_add(len)?;
+    if end > size {
+        return None;
+    }
+    data.checked_add(end)?;
+    data.checked_add(offset)
+}
+
 /// `ExecuteIndirect(signature, max count, arguments, offset, count buffer,
 /// offset)`. Grand Theft Auto VI's signatures (title+0x2479466, 2026-11-24)
 /// hold one argument each: draw (stride 16), indexed draw (20), dispatch
@@ -1147,11 +1221,17 @@ extern "system" fn execute_indirect(
     count_offset: u64,
 ) {
     count_draw();
+    if max == 0 {
+        return;
+    }
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
-    let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
-    let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
+    let bytes = u64::from(stride) * u64::from(max);
+    let address = crate::resource::buffer_bytes(arguments)
+        .and_then(|(p, size)| indirect_address(p as u64, size, offset, bytes));
+    let counter = crate::resource::buffer_bytes(count)
+        .and_then(|(p, size)| indirect_address(p as u64, size, count_offset, 4));
     let mut ran = false;
     #[cfg(windows)]
     if let ([[kind, ..]], Some(address)) = (args, address)
@@ -1159,7 +1239,11 @@ extern "system" fn execute_indirect(
     {
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
-        let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
+        let kind = if *kind == DISPATCH_SINGLE {
+            DISPATCH
+        } else {
+            *kind
+        };
         with_state(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
@@ -1229,7 +1313,8 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         // SAFETY: the same layout; no resource named.
-        let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+        let barrier =
+            unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
     }
@@ -1328,8 +1413,8 @@ const METHODS: [(usize, *const ()); 52] = [
 ];
 /// The rest of [`METHODS`], kept apart only to stay readable.
 const MORE_METHODS: [(usize, *const ()); 9] = [
-    (28, query_mark as *const ()),             // 0xe0 BeginQuery
-    (29, query_mark as *const ()),             // 0xe8 EndQuery
+    (28, begin_query as *const ()),            // 0xe0 BeginQuery
+    (29, end_query as *const ()),              // 0xe8 EndQuery
     (30, resolve_queries as *const ()),        // 0xf0
     (78, dispatch_x as *const ()),             // 0x270
     (98, state::dispatch_mesh_x as *const ()), // 0x310
@@ -1394,6 +1479,16 @@ mod tests {
     use crate::object::slot;
 
     #[test]
+    fn indirect_ranges_stay_inside_the_named_resource() {
+        assert_eq!(indirect_address(0x1000, 48, 16, 32), Some(0x1010));
+        assert_eq!(indirect_address(0x1000, 48, 20, 32), None);
+        assert_eq!(indirect_address(0x1000, 48, 44, 4), Some(0x102c));
+        assert_eq!(indirect_address(0x1000, 48, 48, 4), None);
+        assert_eq!(indirect_address(0x1000, u64::MAX, u64::MAX, 4), None);
+        assert_eq!(indirect_address(u64::MAX - 3, 8, 0, 8), None);
+    }
+
+    #[test]
     fn every_inline_command_falls_back_to_the_table() {
         let null = std::ptr::null();
         let mut allocator = null;
@@ -1426,10 +1521,18 @@ mod tests {
         assert!(!p.is_null() && (p as usize).is_multiple_of(0x100));
         // SAFETY: 40 bytes were handed out.
         unsafe { p.write_bytes(0xab, 40) };
-        assert!(allocate_upload(list, 8, 0x30).is_null(), "not a power of two");
+        assert!(
+            allocate_upload(list, 8, 0x30).is_null(),
+            "not a power of two"
+        );
         assert_eq!(reset(list, allocator, null), S_OK);
         // SAFETY: the list is ours.
-        assert!(unsafe { &(*list.cast::<List>()).uploads }.lock().unwrap().is_empty());
+        assert!(
+            unsafe { &(*list.cast::<List>()).uploads }
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);

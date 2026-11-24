@@ -154,7 +154,7 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -1583,6 +1583,7 @@ impl<'a> Lower<'a> {
 
     /// This lane's bit of the mask `lo`, `hi` (wave64).
     fn lane_bit(&mut self, at: usize, lo: V, hi: Option<V>) -> V {
+        self.s.flags |= flags::WAVE_OPS;
         let lane = self.s.op(
             at,
             "waveGetLaneIndex",
@@ -1931,6 +1932,7 @@ impl<'a> Lower<'a> {
             let m = self.s.m.i32(self.wave() - 1);
             return self.s.m.bin(self.s.entry, Bin::And, f, m);
         }
+        self.s.flags |= flags::WAVE_OPS;
         self.s.op(
             self.cur,
             "waveGetLaneIndex",
@@ -3211,7 +3213,9 @@ impl<'a> Lower<'a> {
     ) -> Result<V, Why> {
         match src {
             Source::Loaded { load, first } => {
-                let key = (self.cur, *load, *first, sampler, props.0);
+                // The same descriptor can serve dimension queries, typed
+                // loads and atomics, each with a different component type.
+                let key = (self.cur, *load, *first, sampler, props);
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
@@ -4048,6 +4052,17 @@ impl<'a> Lower<'a> {
                 Ok(self.s.m.cast(c, Cast::ZExt, x, i64t))
             }
         }
+    }
+
+    /// Two register dwords as one integer, low word first.
+    fn join64(&mut self, lo: V, hi: V) -> V {
+        let c = self.cur;
+        let ty = self.s.m.int(64);
+        let lo = self.s.m.cast(c, Cast::ZExt, lo, ty);
+        let hi = self.s.m.cast(c, Cast::ZExt, hi, ty);
+        let k32 = self.s.m.int_const(ty, 32);
+        let hi = self.s.m.bin(c, Bin::Shl, hi, k32);
+        self.s.m.bin(c, Bin::Or, lo, hi)
     }
 
     /// The low and high dwords of an i64.
@@ -5297,8 +5312,8 @@ impl<'a> Lower<'a> {
                 .is_some_and(|u| u.kind == ResourceType::Uav);
         let props = (kind | if uav { 0x1000 } else { 0 }, 0x409);
         if let Some(op) = name.strip_prefix("image_atomic_") {
-            // DXIL's atomic operations on a 32-bit integer texture UAV; the
-            // old value returns with glc. Sub is the add of the negation.
+            // DXIL's atomic operations on integer texture UAVs; the old
+            // value returns with glc. Sub is the add of the negation.
             let code = match op {
                 "add" | "sub" => 0,
                 "and" => 1,
@@ -5318,12 +5333,15 @@ impl<'a> Lower<'a> {
             if *d16 || *a16 {
                 return Err("a 16-bit image atomic");
             }
-            // dmask: the data dwords (cmpswap: twice the value's).
-            // shortcut: 64-bit image atomics (two dwords, an R32G32 view)
-            // need the host's 64-bit typed atomics; they stop the program.
-            if *dmask != if code == u32::MAX { 3 } else { 1 } {
-                return Err("a 64-bit image atomic");
-            }
+            // DMASK encodes the operand width; compare/exchange consumes
+            // the replacement followed by the comparison, each low word first.
+            let compare = code == u32::MAX;
+            let wide = match (*dmask, compare) {
+                (1, false) | (3, true) => false,
+                (3, false) | (15, true) => true,
+                _ => return Err("an image atomic data mask"),
+            };
+            let words = if wide { 2 } else { 1 };
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
@@ -5332,29 +5350,50 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image atomic data");
             };
-            let vals = self.vgprs(inst, data, if code == u32::MAX { 2 } else { 1 })?;
-            let mut value = vals[0];
-            if op == "sub" {
-                let z = self.s.m.i32(0);
-                value = self.s.m.bin(c, Bin::Sub, z, value);
-            }
-            let old = match inst.read(Reg::V(reg)) {
-                Some(v) if cache.glc => self.i32_of(v)?,
-                _ => self.s.m.i32(0),
+            let vals = self.vgprs(inst, data, words * if compare { 2 } else { 1 })?;
+            let original = if wide {
+                self.join64(vals[0], vals[1])
+            } else {
+                vals[0]
             };
-            let h = self.handle(site, src, false, (kind | 0x1000, 0x105))?;
+            let comparison = if compare {
+                Some(if wide {
+                    self.join64(vals[2], vals[3])
+                } else {
+                    vals[1]
+                })
+            } else {
+                None
+            };
+            let ty = if wide { self.s.m.int(64) } else { self.s.t.i32 };
+            let value = if op == "sub" {
+                let z = self.s.m.int_const(ty, 0);
+                self.s.m.bin(c, Bin::Sub, z, original)
+            } else {
+                original
+            };
+            if wide {
+                // SM 6.6 typed 64-bit atomics require an R32G32_UINT view
+                // and the optional typed + descriptor-heap capabilities.
+                // These flags also let the host reject unsupported adapters.
+                self.s.flags |= flags::INT64 | flags::ATOMIC64_TYPED | flags::ATOMIC64_HEAP;
+            }
+            let props1 = if wide { 0x107 } else { 0x105 }; // one U64 or U32
+            let h = self.handle(site, src, false, (kind | 0x1000, props1))?;
             let at = self.begin_guarded(guard);
-            let i32t = self.s.t.i32;
             let mut args = vec![h];
-            let r = if code == u32::MAX {
-                // cmpswap: data is (new, compare).
+            let r = if let Some(comparison) = comparison {
                 args.extend(cs);
-                args.extend([vals[1], vals[0]]);
+                args.extend([comparison, value]);
                 self.s.op(
                     self.cur,
-                    "atomicCompareExchange.i32",
+                    if wide {
+                        "atomicCompareExchange.i64"
+                    } else {
+                        "atomicCompareExchange.i32"
+                    },
                     Attr::NoUnwind,
-                    i32t,
+                    ty,
                     79,
                     &args,
                 )
@@ -5362,12 +5401,29 @@ impl<'a> Lower<'a> {
                 args.push(self.s.m.i32(code));
                 args.extend(cs);
                 args.push(value);
-                self.s
-                    .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
+                self.s.op(
+                    self.cur,
+                    if wide {
+                        "atomicBinOp.i64"
+                    } else {
+                        "atomicBinOp.i32"
+                    },
+                    Attr::NoUnwind,
+                    ty,
+                    78,
+                    &args,
+                )
             };
-            let r = self.end_guarded(at, &[(r, old)])[0];
+            // An inactive lane retains both of its original data VGPRs.
+            let r = self.end_guarded(at, &[(r, original)])[0];
             if cache.glc {
-                self.write(inst, Reg::V(reg), r, None);
+                if wide {
+                    let (lo, hi) = self.split64(r);
+                    self.write(inst, Reg::V(reg), lo, None);
+                    self.write(inst, Reg::V(reg + 1), hi, None);
+                } else {
+                    self.write(inst, Reg::V(reg), r, None);
+                }
             }
             return Ok(());
         }
@@ -6559,11 +6615,56 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Numeric, Parts, buffer_format, lower};
+    use super::{Fields, HashMap, Lower, Numeric, Parts, buffer_format, lower};
     use crate::native::{ComputeIo, HwStage, NativeProgram, StageIo};
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    #[test]
+    fn image_dimensions_do_not_alias_integer_atomic_handles() {
+        let native = super::super::atomic_tests::program(0x11, true, true, false, None);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let parts = Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        };
+        let bad = HashMap::new();
+        let mut l = Lower::new(&parts, &bad);
+        let d = res
+            .descriptors
+            .iter()
+            .find(|d| {
+                matches!(
+                    p.blocks[d.site.0].insts[d.site.1].fields,
+                    Fields::Image { .. }
+                )
+            })
+            .unwrap();
+        // Descriptor loads reconstruct dimensions with a float4 handle.
+        // Integer accesses must retain their own type and width even
+        // when they use that same descriptor in that same basic block.
+        let float4 = l.handle(d.site, &d.source, false, (0x1002, 0x409)).unwrap();
+        let uint32 = l.handle(d.site, &d.source, false, (0x1002, 0x105)).unwrap();
+        let uint64 = l.handle(d.site, &d.source, false, (0x1002, 0x107)).unwrap();
+        assert_ne!(float4, uint32);
+        assert_ne!(float4, uint64);
+        assert_ne!(uint32, uint64);
+        assert_eq!(
+            uint64,
+            l.handle(d.site, &d.source, false, (0x1002, 0x107)).unwrap()
+        );
+    }
 
     /// Lowers a compute program of constants: whether it translates.
     fn lowers(words: &[u32]) -> Result<(), crate::ShaderError> {

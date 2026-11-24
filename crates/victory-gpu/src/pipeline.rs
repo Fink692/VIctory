@@ -76,6 +76,9 @@ static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None)
 
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
+    // Match offline census identities even when Bytecode.size includes
+    // alignment padding. Unknown or malformed inputs remain unchanged.
+    let bytes = victory_shader::dxbc::canonical_bytes(bytes);
     let full = blake3::hash(bytes);
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
     shaders
@@ -275,7 +278,10 @@ pub(crate) fn note_drop(this: This) {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_why(why: String) {
     let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
-    *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
+    *drops
+        .get_or_insert_with(HashMap::new)
+        .entry(why)
+        .or_default() += 1;
 }
 
 /// The drops counted since the last call, most first (diagnostics).
@@ -522,6 +528,25 @@ mod tests {
             .iter()
             .map(|s| (s.stage, s.container.clone()))
             .collect()
+    }
+
+    #[test]
+    fn shader_identity_matches_census_despite_bytecode_padding() {
+        let mut container = vec![0u8; 32];
+        container[..4].copy_from_slice(b"DXBC");
+        container[20] = 1;
+        container[24..28].copy_from_slice(&32u32.to_le_bytes());
+        let original = shader("compute", &container);
+        let mut padded = container.clone();
+        padded.extend_from_slice(&[0x7f; 16]);
+        let equivalent = shader("compute", &padded);
+        assert!(Arc::ptr_eq(&original, &equivalent));
+        assert_eq!(equivalent.container, container);
+        assert_eq!(equivalent.hash, blake3::hash(&container).to_hex()[..16]);
+        container[4] = 1;
+        let changed = shader("compute", &container);
+        assert!(!Arc::ptr_eq(&original, &changed));
+        assert_ne!(original.hash, changed.hash);
     }
 
     #[test]

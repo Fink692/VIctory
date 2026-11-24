@@ -8,6 +8,7 @@ mod inspect;
 mod run;
 mod shader;
 mod translate;
+mod translate_report;
 
 use std::path::PathBuf;
 
@@ -84,6 +85,13 @@ enum Command {
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
+        /// Write a JSON report outside the repository (must not already exist).
+        #[arg(long)]
+        report: Option<PathBuf>,
+        /// Return an error if any program/check fails, a file cannot be read,
+        /// or no native programs are found. Useful for regression gates.
+        #[arg(long)]
+        fail_on_error: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -152,7 +160,19 @@ fn main() -> Result<()> {
             pipelines,
             list,
             jobs,
-        } => translate::run(paths, validate, pipelines, list, jobs),
+            report,
+            fail_on_error,
+        } => translate::run(
+            paths,
+            translate::Options {
+                validate,
+                pipelines,
+                list,
+                jobs,
+                report,
+                fail_on_error,
+            },
+        ),
         Command::Run {
             exe,
             unimplemented,

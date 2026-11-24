@@ -50,10 +50,12 @@
 //!   descriptors (1,024 world compute programs, ray-tracing material
 //!   resolves) read raw views this way.
 //!
-//! * **Texture atomics** (added 2026-11-23): a texture UAV the shader uses
-//!   atomically is declared a 32-bit unsigned single-channel view; the
-//!   host's view at that index must be an R32 integer view (64-bit atomics
-//!   stop the translation). Global loads from a root SRV read it raw.
+//! * **Texture atomics**: 32-bit operations use an R32_UINT UAV; 64-bit
+//!   operations use a scalar U64 annotation over an R32G32_UINT UAV. The
+//!   latter require Int64ShaderOps and the optional SM 6.6 typed-resource
+//!   and descriptor-heap 64-bit atomic capabilities. No pair of 32-bit
+//!   atomics can substitute for one atomic 64-bit operation. Global loads
+//!   from a root SRV read it raw.
 //!
 //! Entry points: [`translate`] (container bytes as the title passes them
 //! at pipeline creation → [`HostShader`]), [`emit`] (the same with the
@@ -75,6 +77,8 @@
 //!   the console's, without `SV_PrimitiveID` and `SV_CullPrimitive` (the
 //!   console never exports them).
 
+#[cfg(test)]
+mod atomic_tests;
 mod bitcode;
 mod container;
 #[cfg(all(test, windows))]
@@ -157,6 +161,20 @@ pub struct HostShader {
 }
 
 impl HostShader {
+    /// Whether this container requires optional 64-bit image atomic support.
+    /// Read from SFI0 so a shader restored from the disk cache has the same
+    /// requirements as a freshly translated one.
+    pub fn requires_i64_image_atomics(&self) -> bool {
+        Container::parse(&self.dxil)
+            .ok()
+            .and_then(|c| {
+                c.part(FourCC::SFI0)
+                    .and_then(|p| p.data.get(..8))
+                    .map(|bytes| u64::from_le_bytes(bytes.try_into().expect("8 bytes")))
+            })
+            .is_some_and(|features| features & (0x40_0000 | 0x1000_0000) != 0)
+    }
+
     /// Size of the user-data buffer the shader declares, in dwords (a
     /// multiple of 4; 0 when it reads none). Root constants must cover it.
     pub fn user_data_dwords(&self) -> u32 {

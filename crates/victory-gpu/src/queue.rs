@@ -172,6 +172,17 @@ extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
     if out.is_null() {
         return E_INVALIDARG;
     }
+    #[cfg(windows)]
+    if let Some(host) = crate::host::host() {
+        return match host.timestamp_frequency() {
+            Ok(frequency) => {
+                // SAFETY: checked non-null.
+                unsafe { out.write(frequency) };
+                S_OK
+            }
+            Err(e) => e.code().0,
+        };
+    }
     // SAFETY: checked non-null.
     unsafe { out.write(TIMESTAMP_FREQUENCY) };
     S_OK
@@ -182,8 +193,8 @@ const TIMESTAMP_FREQUENCY: u64 = 100_000_000;
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Written {
     Value(u64),
-    /// The GPU clock: [`TIMESTAMP_FREQUENCY`] ticks per second since the
-    /// process started (our GPU work is done on the CPU's timeline).
+    /// The host GPU clock, shared with query results. Without a host GPU,
+    /// the portable tests use [`TIMESTAMP_FREQUENCY`] ticks per second.
     GpuTimestamp,
     /// The CPU's performance counter.
     SystemTimestamp,
@@ -194,11 +205,7 @@ impl Written {
     pub(crate) fn write(self, at: *mut u8, bytes: usize) {
         let value = match self {
             Written::Value(v) => v,
-            Written::GpuTimestamp => {
-                static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-                let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
-                (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64
-            }
+            Written::GpuTimestamp => gpu_timestamp(),
             Written::SystemTimestamp => system_timestamp(),
         };
         // SAFETY: the title names writable GPU memory (unified with ours).
@@ -210,6 +217,19 @@ impl Written {
             }
         }
     }
+}
+
+fn gpu_timestamp() -> u64 {
+    #[cfg(windows)]
+    if let Some(host) = crate::host::host() {
+        return host.timestamp().unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "host GPU clock unavailable");
+            0
+        });
+    }
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
+    (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64
 }
 
 fn system_timestamp() -> u64 {
@@ -403,7 +423,9 @@ extern "system" fn copy_page_mappings(
     }
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
+        ONCE.call_once(|| {
+            tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed")
+        });
     }
     S_OK
 }
